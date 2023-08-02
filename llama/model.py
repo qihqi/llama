@@ -5,15 +5,10 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-import fairscale.nn.model_parallel.initialize as fs_init
 import torch
 import torch.nn.functional as F
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    ParallelEmbedding,
-    RowParallelLinear,
-)
 from torch import nn
+
 
 
 @dataclass
@@ -198,39 +193,30 @@ class Attention(nn.Module):
         """
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        model_parallel_size = fs_init.get_model_parallel_world_size()
-        self.n_local_heads = args.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        self.n_local_heads = args.n_heads
+        self.n_local_kv_heads = self.n_kv_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = ColumnParallelLinear(
+        self.wq = nn.Linear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wk = ColumnParallelLinear(
+        self.wk = nn.Linear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wv = ColumnParallelLinear(
+        self.wv = nn.Linear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wo = RowParallelLinear(
+        self.wo = nn.Linear(
             args.n_heads * self.head_dim,
             args.dim,
             bias=False,
-            input_is_parallel=True,
-            init_method=lambda x: x,
         )
 
         self.cache_k = torch.zeros(
@@ -240,7 +226,7 @@ class Attention(nn.Module):
                 self.n_local_kv_heads,
                 self.head_dim,
             )
-        ).cuda()
+        )
         self.cache_v = torch.zeros(
             (
                 args.max_batch_size,
@@ -248,7 +234,7 @@ class Attention(nn.Module):
                 self.n_local_kv_heads,
                 self.head_dim,
             )
-        ).cuda()
+        )
 
     def forward(
         self,
@@ -278,9 +264,6 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
 
         self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
         self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
@@ -334,14 +317,14 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        self.w1 = nn.Linear(
+            dim, hidden_dim, bias=False,
         )
-        self.w2 = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+        self.w2 = nn.Linear(
+            hidden_dim, dim, bias=False,
         )
-        self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        self.w3 = nn.Linear(
+            dim, hidden_dim, bias=False,
         )
 
     def forward(self, x):
@@ -434,52 +417,94 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = ParallelEmbedding(
-            params.vocab_size, params.dim, init_method=lambda x: x
-        )
+        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = ColumnParallelLinear(
-            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
+        self.output = nn.Linear(
+            params.dim, params.vocab_size, bias=False,
         )
 
-        self.freqs_cis = precompute_freqs_cis(
-            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
-            # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
+        freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
+        self.register_buffer('freqs_cis', freqs_cis, persistent=False)
 
-    @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
-        """
-        Perform a forward pass through the Transformer model.
+        mask = torch.full(
+            (1, 1, self.params.max_seq_len, self.params.max_seq_len),
+            float("-inf")).to(torch.float)
+        mask = torch.triu(mask, diagonal=1)
+        self.register_buffer("mask", mask)
 
-        Args:
-            tokens (torch.Tensor): Input token indices.
-            start_pos (int): Starting position for attention caching.
-
-        Returns:
-            torch.Tensor: Output logits after applying the Transformer model.
-
-        """
+    def forward2(self, tokens: torch.Tensor, start_pos: int):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        # freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        # freqs_cis = self.freqs_cis[:seqlen] #(self.freqs_cis, 0, 0, seqlen)
+        freqs_cis = torch.index_select(
+                self.freqs_cis, 0, torch.arange(0, seqlen).to(device=self.freqs_cis.device))
 
         mask = None
         if seqlen > 1:
             mask = torch.full(
                 (1, 1, seqlen, seqlen), float("-inf"), device=tokens.device
             )
-            mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
+            mask = torch.triu(mask, diagonal=start_pos + 1)
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
+        return self.output(h)
+        # output = self.output(h).float()
+        # return output
+
+    @torch.no_grad()
+    def forward(
+		self,
+		tokens: torch.Tensor, input_indexes: torch.Tensor, output_index: Optional[torch.Tensor]):
+        _bsz, seqlen = tokens.shape
+
+        h = self.tok_embeddings(tokens)
+        freqs_cis = self.freqs_cis.index_select(0, input_indexes)
+        mask = self.mask.index_select(2, input_indexes)
+        for layer in self.layers:
+            h = layer(h, freqs_cis, mask, input_indexes)
+        h = self.norm(h)
+        if output_index is not None:
+            h = h.index_select(1, output_index - input_indexes[0]).squeeze(dim=1)
         output = self.output(h).float()
         return output
+
+
+def sample_top_p(probs, p):
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask = probs_sum - probs_sort > p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    next_token = torch.multinomial(probs_sort, num_samples=1)
+    next_token = torch.gather(probs_idx, -1, next_token)
+    return next_token
+
+
+class GenLoop(torch.nn.Module):
+
+    def __init__(self, transformer):
+        super().__init__()
+        self.transformer = transformer
+
+    def forward(self, prompt_tokens: torch.Tensor):
+        max_gen_len = 50
+        top_p = 0.9
+        results = []
+        x = prompt_tokens
+        for i in range(max_gen_len):
+            logits = self.transformer.forward(x, i)
+            probs = torch.softmax(logits[:, -1] / 0.6, dim=-1)
+            next_token = torch.argmax(logits[:, -1], dim=-1)
+            results.append(next_token)
+            x = next_token.reshape(1, -1)
+        return torch.stack(results)
