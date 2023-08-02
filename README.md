@@ -1,3 +1,81 @@
+
+# Export llama2 model to stablehlo format.
+
+This repo is a forked llama model with scripts to export it
+to StableHLO format.
+
+dependencies: torch and torchxla nightly; jax
+We need CPU version of both torch and torchxla; and tpu version (or gpu version) of jax:
+```
+pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cpu
+pip install https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-nightly-cp310-cp310-linux_x86_64.whl
+pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+```
+
+To regenerate stablehlo model:
+
+```
+PJRT_DEVICE=cpu python export_llama_to_stablehlo.py --param_size [tiny or 7b or 13b or 70b] --context_length 2048 --infer_length 256 --path_prefix=path/to/output
+```
+
+Example:
+```
+hanq@t1v-n-cfe84bb3-w-0:~/llama$ python export_llama_to_stablehlo.py stablehlo_graphs/7b-chat/ --param_size=7b --checkpoint_dir=llama-2-7b-chat/
+```
+
+Then `find stable_graphs/7b-chat/` will output
+
+```
+hanq@t1v-n-cfe84bb3-w-0:~/llama$ find stablehlo_graphs/7b-chat/
+stablehlo_graphs/7b-chat/
+stablehlo_graphs/7b-chat/functions
+stablehlo_graphs/7b-chat/functions/decode_forward.meta
+stablehlo_graphs/7b-chat/functions/prefill_forward.bytecode
+stablehlo_graphs/7b-chat/functions/prefill_forward.mlir
+stablehlo_graphs/7b-chat/functions/decode_forward.mlir
+stablehlo_graphs/7b-chat/functions/decode_forward.bytecode
+stablehlo_graphs/7b-chat/functions/prefill_forward.meta
+stablehlo_graphs/7b-chat/constants
+stablehlo_graphs/7b-chat/constants/2
+stablehlo_graphs/7b-chat/constants/3
+stablehlo_graphs/7b-chat/constants/5
+stablehlo_graphs/7b-chat/constants/6
+stablehlo_graphs/7b-chat/constants/1
+stablehlo_graphs/7b-chat/constants/4
+stablehlo_graphs/7b-chat/constants/0
+stablehlo_graphs/7b-chat/METADATA.json
+stablehlo_graphs/7b-chat/data
+stablehlo_graphs/7b-chat/data/layers.1.feed_forward.w3.weight
+stablehlo_graphs/7b-chat/data/layers.16.ffn_norm.weight
+...
+```
+
+This command will create 2 graphs: one for prefill and another for decode.
+Input size for the prefill function will be context length
+Input size for decode will be 1
+Currently this export the **unbatched** graph.
+Both of them are the `forward` function of `Transformer` class but traced with different inputs.
+
+Rest of the content is weights.
+
+
+Model definition is stored in llama/model_exportable_unbatched.py. This file is a fork of llama/model.py with 
+modification to make it exportable.
+
+To run the exported graph:
+
+```
+python python run_stablehlo_model.py stablehlo_graphs/7b-chat
+```
+
+It will just call prefill and decode once.
+
+
+
+
+# Below is the original README from facebookresearch/llama
+
+
 # Llama 2
 
 We are unlocking the power of large language models. Our latest version of Llama is now accessible to individuals, creators, researchers and businesses of all sizes so that they can experiment, innovate and scale their ideas responsibly. 
