@@ -339,16 +339,7 @@ class Transformer(nn.Module):
             ))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = ColumnParallelLinear(
-            params.dim,
-            params.vocab_size,
-            bias=False,
-            init_method=init_method,
-            world_size=world_size,
-            rank=rank,
-            groups=groups,
-            quant=params.quant,
-        )
+        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
         freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
