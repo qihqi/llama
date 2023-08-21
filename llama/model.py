@@ -249,7 +249,13 @@ class Transformer(nn.Module):
         )
         self.register_buffer('freqs_cis', freqs_cis, persistent=False)
 
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+        mask = torch.full(
+            (1, 1, self.params.max_seq_len, self.params.max_seq_len),
+            float("-inf")).to(torch.float)
+        mask = torch.triu(mask, diagonal=1)
+        self.register_buffer("mask", mask)
+
+    def forward2(self, tokens: torch.Tensor, start_pos: int):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         # freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
@@ -270,3 +276,51 @@ class Transformer(nn.Module):
         return self.output(h)
         # output = self.output(h).float()
         # return output
+
+    @torch.no_grad()
+    def forward(
+		self,
+		tokens: torch.Tensor, input_indexes: torch.Tensor, output_index: Optional[torch.Tensor]):
+        _bsz, seqlen = tokens.shape
+
+        h = self.tok_embeddings(tokens)
+        freqs_cis = self.freqs_cis.index_select(0, input_indexes)
+        mask = self.mask.index_select(2, input_indexes)
+        for layer in self.layers:
+            h = layer(h, freqs_cis, mask, input_indexes)
+        h = self.norm(h)
+        if output_index is not None:
+            h = h.index_select(1, output_index - input_indexes[0]).squeeze(dim=1)
+        output = self.output(h).float()
+        return output
+
+
+def sample_top_p(probs, p):
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask = probs_sum - probs_sort > p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    next_token = torch.multinomial(probs_sort, num_samples=1)
+    next_token = torch.gather(probs_idx, -1, next_token)
+    return next_token
+
+
+class GenLoop(torch.nn.Module):
+
+    def __init__(self, transformer):
+        super().__init__()
+        self.transformer = transformer
+
+    def forward(self, prompt_tokens: torch.Tensor):
+        max_gen_len = 50
+        top_p = 0.9
+        results = []
+        x = prompt_tokens
+        for i in range(max_gen_len):
+            logits = self.transformer.forward(x, i)
+            probs = torch.softmax(logits[:, -1] / 0.6, dim=-1)
+            next_token = torch.argmax(logits[:, -1], dim=-1)
+            results.append(next_token)
+            x = next_token.reshape(1, -1)
+        return torch.stack(results)
