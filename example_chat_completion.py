@@ -118,7 +118,7 @@ def mp_main(
             kwargs = {"nprocs": torch.cuda.device_count(),
                       "join": True}
         else:
-            kwargs = {}
+            kwargs = {'nprocs': 4}
         xmp.spawn(_fn,
                   args=(ckpt_dir, tokenizer_path, temperature, top_p, max_seq_len, max_batch_size, max_gen_len, dynamo), **kwargs)
     else:

@@ -9,6 +9,8 @@ from llama import Llama
 
 USE_CUDA = os.environ.get('USE_CUDA', False)
 
+torch.set_default_dtype(torch.float32)
+
 # Some how xla init will slow down the CUDA speed.
 if USE_CUDA:
     import torch.multiprocessing as xmp
@@ -117,9 +119,9 @@ def mp_main(
             kwargs = {"nprocs": torch.cuda.device_count(),
                       "join": True}
         else:
-            kwargs = {}
+            kwargs = {'nprocs': 4}
         xmp.spawn(_fn,
-                  args=(ckpt_dir, tokenizer_path, temperature, top_p, max_seq_len, max_gen_len, max_batch_size, dynamo, spmd), **kwargs)
+                args=(ckpt_dir, tokenizer_path, temperature, top_p, max_seq_len, max_gen_len, max_batch_size, dynamo, spmd),nprocs=4)
     else:
         main(ckpt_dir, tokenizer_path, temperature, top_p, max_seq_len, max_gen_len, max_batch_size, dynamo, spmd)
 

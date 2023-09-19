@@ -85,8 +85,8 @@ class Llama:
         rank = get_model_parallel_rank()
         model_parallel_size = get_model_parallel_world_size()
 
-        if rank > 0:
-            sys.stdout = open(os.devnull, "w")
+       # if rank > 0:
+       #     sys.stdout = open(os.devnull, "w")
 
         start_time = time.time()
         checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
@@ -109,18 +109,17 @@ class Llama:
         )
 
         model_args.print_values()
+        print('My rank: ', rank)
 
         tokenizer = Tokenizer(model_path=tokenizer_path)
         model_args.vocab_size = tokenizer.n_words
         if USE_CUDA:
             torch.set_default_tensor_type(torch.cuda.HalfTensor)
-        else:
-            torch.set_default_tensor_type(torch.BFloat16Tensor)
         model = Transformer(model_args)
         if checkpoint:
             model.load_state_dict(checkpoint, strict=False)
         model = model.to(device)
-        print(f"Loaded in {time.time() - start_time:.2f} seconds")
+        print(f"Loaded in {time.time() - start_time:.2f} seconds", rank)
 
         return Llama(model, tokenizer, device, dynamo, spmd)
 
@@ -133,14 +132,15 @@ class Llama:
 
         if spmd:
             num_devices = self.num_devices  # Should be 8 on v5-8
+            print('num_devices', num_devices)
             device_ids = np.arange(num_devices)
 
-            # manually shard the kv cache
+#            # manually shard the kv cache
             four_d_mesh = xs.Mesh(device_ids, (1, 1, num_devices, 1))
-            for layer in model.layers:
-                xs.mark_sharding(layer.attention.cache_k, four_d_mesh, (0, 1, 2, 3))
-                xs.mark_sharding(layer.attention.cache_v, four_d_mesh, (0, 1, 2, 3))
-
+#            for layer in model.layers:
+#                xs.mark_sharding(layer.attention.cache_k, four_d_mesh, (0, 1, 2, 3))
+#                xs.mark_sharding(layer.attention.cache_v, four_d_mesh, (0, 1, 2, 3))
+#
             col_mesh = xs.Mesh(device_ids, (1, num_devices))
             row_mesh = xs.Mesh(device_ids, (num_devices, 1))
 
@@ -160,6 +160,47 @@ class Llama:
                 if 'output' in name:
                     xs.mark_sharding(layer.weight, col_mesh, (0, 1))
 
+        rank = get_model_parallel_rank()
+        caches_k = []
+        caches_v = []
+
+        n_kv_heads = model.params.n_heads if model.params.n_kv_heads is None else modelparams.n_kv_heads
+
+        device = xm.xla_device()
+        head_dim = model.params.dim // model.params.n_heads
+        for layer in model.layers:
+            cache_k = torch.zeros((
+                model.params.max_batch_size,
+                model.params.max_seq_len,
+                n_kv_heads,
+                head_dim,
+            )).to(device)
+            cache_v = torch.zeros((
+                model.params.max_batch_size,
+                model.params.max_seq_len,
+                n_kv_heads,
+                head_dim,
+            )).to(device)
+
+            if spmd:
+                xs.mark_sharding(cache_k, four_d_mesh, (0, 1, 2, 3))
+                xs.mark_sharding(cache_v, four_d_mesh, (0, 1, 2, 3))
+            caches_k.append(cache_k)
+            caches_v.append(cache_v)
+            
+        self._caches_k = caches_k
+        self._caches_v = caches_v
+        sample_input = (torch.randint(0, 1000, (1, 128)).to(device),
+                torch.arange(0, 128).to(device), None, caches_k, caches_v)
+        from torch._export import export
+        print('start export', rank)
+        xported = export(model, sample_input)
+        print('finish export', rank)
+        torch_xla.save_as_stablehlo(xported, '/mnt/hanq/llama2_annotated')
+        print('finish sqave', rank)
+        import sys
+        sys.exit(1)
+
         if dynamo:
             if USE_CUDA:
                 # Inductor errors out when compiles _generate_one_token_fn.
@@ -176,10 +217,10 @@ class Llama:
                             output_pos_tensor, temperature_tensor,
                             top_p_tensor, with_temp, logprobs, token_logprobs, eos_reached, pad_id):
         if logprobs:
-            full_logits = self.model(input_tokens, input_pos_tensor, None)
+            full_logits, self._caches_k, self._caches_v = self.model(input_tokens, input_pos_tensor, None, self._caches_k, self._caches_v)
             logits = full_logits.index_select(1, output_pos_tensor - input_pos_tensor[0]).squeeze(dim=1)
         else:
-            logits = self.model(input_tokens, input_pos_tensor, output_pos_tensor)
+            logits, self._caches_k, self._caches_v = self.model(input_tokens, input_pos_tensor, output_pos_tensor, self._caches_k, self._caches_v)
         if with_temp:
             probs = torch.softmax(logits / temperature_tensor, dim=-1)
             next_token = sample_top_p(probs, top_p_tensor)

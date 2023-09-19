@@ -142,31 +142,14 @@ class Attention(nn.Module):
             bias=False,
         )
 
-        cache_k = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        )
-        self.register_buffer("cache_k", cache_k)
-        cache_v = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        )
-        self.register_buffer("cache_v", cache_v)
-
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
         input_indexes: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -177,11 +160,11 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.index_copy(1, input_indexes, xk)
-        self.cache_v = self.cache_v.index_copy(1, input_indexes, xv)
+        cache_k = cache_k.index_copy(1, input_indexes, xk)
+        cache_v = cache_v.index_copy(1, input_indexes, xv)
 
-        keys = self.cache_k[:, :]
-        values = self.cache_v[:, :]
+        keys = cache_k[:, :]
+        values = cache_v[:, :]
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
@@ -297,9 +280,11 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
         input_indexes: torch.Tensor,
+        cache_k, cache_v
     ):
         h = x + self.attention.forward(
-            self.attention_norm(x), freqs_cis, mask, input_indexes
+            self.attention_norm(x), freqs_cis, mask, input_indexes,
+            cache_k, cache_v
         )
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
@@ -353,18 +338,21 @@ class Transformer(nn.Module):
         self.register_buffer("mask", mask)
 
     @torch.no_grad()
-    def forward(self, tokens: torch.Tensor, input_indexes: torch.Tensor, output_index: Optional[torch.Tensor]):
+    def forward(self, tokens: torch.Tensor, input_indexes: torch.Tensor, output_index: Optional[torch.Tensor], caches_k, caches_v):
         _bsz, seqlen = tokens.shape
         assert _bsz == self.params.max_batch_size
         h = self.tok_embeddings(tokens)
         freqs_cis = self.freqs_cis.index_select(0, input_indexes)
 
         mask = self.mask.index_select(2, input_indexes)
+        
+        for i, layer in enumerate(self.layers):
+            cache_k = caches_k[i]
+            cache_v = caches_v[i]
+            h = layer(h, freqs_cis, mask, input_indexes, cache_k, cache_v)
 
-        for layer in self.layers:
-            h = layer(h, freqs_cis, mask, input_indexes)
         h = self.norm(h)
         if output_index is not None:
             h = h.index_select(1, output_index - input_indexes[0]).squeeze(dim=1)
         output = self.output(h).float()
-        return output
+        return output, caches_k, caches_v

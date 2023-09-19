@@ -31,16 +31,20 @@ def set_g_group():
     assert USE_CUDA, "This hack is only for PyTorch non-XLA CUDA paths, i.e., eager and inductor."
     TAG, RANKSET, GROUP_SIZE = fc._expand_group(c10d._get_default_group())
 
+import torch_xla.core.xla_env_vars as xenv
 
 def get_model_parallel_rank():
     if USE_CUDA:
         return dist.get_rank()
+    return int(os.environ.get(xenv.PJRT_LOCAL_PROCESS_RANK, 0))
     return xm.get_ordinal()
 
 
 def get_model_parallel_world_size():
     if USE_CUDA:
         return dist.get_world_size()
+
+    return int(os.environ.get(xenv.PJRT_LOCAL_PROCESS_COUNT, 1) )
     return xm.xrt_world_size()
 
 
