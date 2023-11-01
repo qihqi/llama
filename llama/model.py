@@ -119,7 +119,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     """
     ndim = x.ndim
     assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1]), (x.shape, freqs_cis.shape)
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
@@ -274,6 +274,8 @@ class Attention(nn.Module):
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         values = repeat_kv(values, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+
+        print('key shape', keys.shape)
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)
@@ -437,15 +439,17 @@ class Transformer(nn.Module):
             (1, 1, self.params.max_seq_len, self.params.max_seq_len),
             float("-inf")).to(torch.float)
         mask = torch.triu(mask, diagonal=1)
-        self.register_buffer("mask", mask)
+        self.mask = mask
+        #self.register_buffer("mask", mask)
 
     def forward2(self, tokens: torch.Tensor, start_pos: int):
-        _bsz, seqlen = tokens.shape
+        seqlen = tokens.shape[-1]
         h = self.tok_embeddings(tokens)
-        # freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        print('freqs_cis ', self.freqs_cis.shape)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         # freqs_cis = self.freqs_cis[:seqlen] #(self.freqs_cis, 0, 0, seqlen)
-        freqs_cis = torch.index_select(
-                self.freqs_cis, 0, torch.arange(0, seqlen).to(device=self.freqs_cis.device))
+        #freqs_cis = torch.index_select(
+        #        self.freqs_cis, 0, torch.arange(0, seqlen).to(device=self.freqs_cis.device))
 
         mask = None
         if seqlen > 1:
@@ -464,17 +468,19 @@ class Transformer(nn.Module):
     @torch.no_grad()
     def forward(
 		self,
-		tokens: torch.Tensor, input_indexes: torch.Tensor, output_index: Optional[torch.Tensor]):
-        _bsz, seqlen = tokens.shape
+		tokens: torch.Tensor, input_indexes: torch.Tensor, prefill: bool):
 
+        _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
+        # note this is for rope: https://arxiv.org/abs/2104.09864
+        # freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         freqs_cis = self.freqs_cis.index_select(0, input_indexes)
-        mask = self.mask.index_select(2, input_indexes)
+        mask = None
+        if prefill:
+            mask = self.mask.index_select(2, input_indexes)
         for layer in self.layers:
             h = layer(h, freqs_cis, mask, input_indexes)
         h = self.norm(h)
-        if output_index is not None:
-            h = h.index_select(1, output_index - input_indexes[0]).squeeze(dim=1)
         output = self.output(h).float()
         return output
 

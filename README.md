@@ -1,3 +1,39 @@
+
+# Export llama2 model to stablehlo format.
+
+This repo is a forked llama model with scripts to export it
+to StableHLO format.
+
+in `stablehlo_graphs/7b` we already converted the 7b version
+of the llama2.
+
+In this folder, there are 2 sub folders:
+* prefill is the graph that takes a list of 2048 tokens (fixed context)
+  , with empty kv cache,
+  and do one inference as well as fill the kv cache, and returns the kv cache
+* decode is the graph that takes a list of  1 tokens and filled kv cache,
+  that do inference for the next token, and also returns updated kv cache.
+
+To regenerate stablehlo model:
+
+```
+python export_llama_to_stablehlo.py --param_size [tiny or 7b or 13b or 70b] --context_length 2048 --infer_length 256 --path_prefix=path/to/output
+```
+
+This command will create 2 graphs: one for prefill and another for decode.
+Input size for the prefill function will be context length
+Input size for decode will be 1
+Currently this export the **unbatched** graph.
+
+Model definition is stored in llama/model_exportable_unbatched.py. This file is a fork of llama/model.py with 
+modification to make it exportable.
+
+
+
+
+# Below is the original README from facebookresearch/llama
+
+
 # Llama 2
 
 We are unlocking the power of large language models. Our latest version of Llama is now accessible to individuals, creators, researchers and businesses of all sizes so that they can experiment, innovate and scale their ideas responsibly. 
