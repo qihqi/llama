@@ -239,7 +239,7 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
+        indexes, cache_indexes,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
@@ -265,11 +265,11 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        self.cache_k[:bsz, indexes] = xk
+        self.cache_v[:bsz, indexes] = xv
 
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+        keys = self.cache_k[:bsz, cache_indexes]
+        values = self.cache_v[:bsz, cache_indexes]
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
@@ -369,7 +369,7 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
+        indexes, cache_indexes,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
@@ -387,7 +387,7 @@ class TransformerBlock(nn.Module):
 
         """
         h = x + self.attention.forward(
-            self.attention_norm(x), start_pos, freqs_cis, mask
+            self.attention_norm(x), indexes, cache_indexes, freqs_cis, mask
         )
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
@@ -432,21 +432,16 @@ class Transformer(nn.Module):
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
 
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, indexes, cache_indexes, mask):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
-
-        mask = None
-        if seqlen > 1:
-            mask = torch.full(
-                (1, 1, seqlen, seqlen), float("-inf"), device=tokens.device
-            )
-            mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
+        # freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        # indexes = torch.arange(start_pos, start_pos + seqlen)
+        freqs_cis = torch.index_select(self.freqs_cis, 0, indexes)
 
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, indexes, cache_indexes, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
         return output
