@@ -1,3 +1,5 @@
+import os
+import json
 import time
 import jax
 import fire
@@ -51,14 +53,22 @@ def main(model_dir, checkpoint_dir=None):
     jax.config.update('jax_enable_x64', True)
     start = time.time()
     print('start', 0)
+    with open(os.path.join(model_dir, 'METADATA.json')) as f:
+        metadata = json.load(f)
     m, caches = load_stablehlo_model(checkpoint_dir, model_dir)
     print('loaded grah', time.time() - start)
     tokenizer = Tokenizer(model_path=tokenizer_path)
     print('loaded tokenizer', time.time() - start)
     print('prepare input', time.time() - start)
-    print(m.call_prefill(torch.arange(100), caches)[0].shape)
+    if metadata['batch_size']:
+        prefill_shape = (metadata['batch_size'], metadata['context_length'])
+        decode_shape = (metadata['batch_size'], 1)
+    else:
+        prefill_shape = (metadata['context_length'], )
+        decode_shape = (1, )
+    print(m.call_prefill(torch.randint(0, 32000, prefill_shape), caches)[0].shape)
     print('one prefill', time.time() - start)
-    print(m.call_decode(torch.arange(1), caches)[0].shape)
+    print(m.call_decode(torch.randint(0, 32000, decode_shape), caches)[0].shape)
     print('one decode ', time.time() - start)
 
 

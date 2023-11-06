@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from llama.model import ModelArgs, Transformer, GenLoop
 from llama.stablehlo_model import get_arg, make_cache, merge_bundle
 from llama import model_exportable_unbatched
+from llama import model_exportable
 from llama.tokenizer import Tokenizer
 
 ckpt_dir = 'llama-2-7b-chat'
@@ -62,6 +63,7 @@ def make_exported_to_use_orig_names(nn_module, exported):
 def export_llama2_to_stablehlo(
     path_prefix: str,
     checkpoint_dir: Optional[str] = None,
+    batch_size: Optional[int] = 2,
     param_size: str = 'tiny',
     context_length: int = 2048,
     infer_length: int = 256,
@@ -76,10 +78,14 @@ def export_llama2_to_stablehlo(
     model_arg.vocab_size = tokenizer.n_words
 
     start = time.time()
-    m = model_exportable_unbatched.Transformer(model_arg)
+    if batch_size is None:
+        m = model_exportable_unbatched.Transformer(model_arg)
+    else:
+        m = model_exportable.Transformer(model_arg)
+
     end = time.time()
     print('Model init took', end - start, 'seconds')
-    caches = make_cache(model_arg)
+    caches = make_cache(model_arg, batch_size)
 
     if checkpoint_dir:
         checkpoints = sorted(Path(checkpoint_dir).glob("*.pth"))
@@ -89,17 +95,24 @@ def export_llama2_to_stablehlo(
         checkpoint = torch.load(checkpoints[0])
         m.load_state_dict(checkpoint, strict=False)
 
+    if batch_size is not None:
+        input_shape_prefill = (batch_size, context_length)
+        input_shape_decode = (batch_size, 1)
+    else:
+        input_shape_prefill = (context_length, )
+        input_shape_decode = (1,)
+
     sample_input_prefill = (
-        torch.randint(0, 1000, (context_length, )),  # len seq length
+        torch.randint(0, 1000, input_shape_prefill),  # len seq length
         torch.arange(0, context_length), # input indexes
         torch.arange(0, context_length), # context indexes
         caches, # caches
         True, # prefil
     )
-    # m(*sample_input_prefill)
+    #m(*sample_input_prefill)
 
     sample_input_decode = (
-        torch.randint(0, 1000, (1, )),  # len = 1
+        torch.randint(0, 1000, input_shape_decode),  # len = 1
         torch.arange(context_length, context_length + 1), # input indexes
         torch.arange(1, context_length + 1), # context indexes
         caches,
@@ -122,7 +135,9 @@ def export_llama2_to_stablehlo(
             json.dump({
                 'context_length': context_length, 
                 'infer_length': infer_length, 
-                'param_size': param_size}, f)
+                'param_size': param_size,
+                'batch_size': batch_size
+            }, f)
     print('done')
 
 

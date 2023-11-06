@@ -20,7 +20,7 @@ PJRT_DEVICE=cpu python export_llama_to_stablehlo.py --param_size [tiny or 7b or 
 
 Example:
 ```
-hanq@t1v-n-cfe84bb3-w-0:~/llama$ python export_llama_to_stablehlo.py stablehlo_graphs/7b-chat/ --param_size=7b --checkpoint_dir=llama-2-7b-chat/
+hanq@t1v-n-cfe84bb3-w-0:~/llama$ python export_llama_to_stablehlo.py stablehlo_graphs/7b-chat/ --param_size=7b --checkpoint_dir=llama-2-7b-chat/ --batch_size=2
 ```
 
 Then `find stable_graphs/7b-chat/` will output
@@ -53,7 +53,6 @@ stablehlo_graphs/7b-chat/data/layers.16.ffn_norm.weight
 This command will create 2 graphs: one for prefill and another for decode.
 Input size for the prefill function will be context length
 Input size for decode will be 1
-Currently this export the **unbatched** graph.
 Both of them are the `forward` function of `Transformer` class but traced with different inputs.
 
 Rest of the content is weights.

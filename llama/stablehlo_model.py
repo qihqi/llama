@@ -63,7 +63,7 @@ def merge_bundle(**kwargs):
     return new_bundle
     
 
-def make_cache(args):
+def make_cache(args, batch_size):
     n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
     n_local_heads = args.n_heads
     n_local_kv_heads = n_kv_heads
@@ -71,17 +71,20 @@ def make_cache(args):
     head_dim = args.dim // args.n_heads
     res = []
     for i in range(args.n_layers):
-        res.append((torch.zeros (
-                #max_batch_size,
+        if batch_size is None:
+            size = (
                 args.max_seq_len,
                 n_local_kv_heads,
                 head_dim,
-            ), torch.zeros (
-                #max_batch_size,
+            )
+        else:
+            size = (
+                batch_size,
                 args.max_seq_len,
                 n_local_kv_heads,
                 head_dim,
-            )))
+            )
+        res.append((torch.zeros(size), torch.zeros(size)))
     return res
 
 
@@ -164,11 +167,11 @@ def _fill_freqs_cis(state_dict, model_args):
     )
 
 
-def make_prefill_input(caches, tokens_int):
+def make_prefill_input(caches, tokens):
     # todo: use tokens str to generate input
     # NOTE prefill input size has to be same as context length
     input_prefill = (
-        torch.randint(0, 1000, (CONTEXT_LENGTH, )).to(torch.int64),  # len seq length
+        tokens,
         torch.arange(0, CONTEXT_LENGTH).to(torch.int64), # input indexes
         torch.arange(0, CONTEXT_LENGTH).to(torch.int64), # context indexes
         caches, # caches
@@ -176,12 +179,12 @@ def make_prefill_input(caches, tokens_int):
     )
     return input_prefill
 
-def make_decode_input(caches, tokens_str, position):
+def make_decode_input(caches, tokens, position):
     # todo: use tokens str to generate input
     # NOTE decode input size has to be 1
     # NOTE possition > CONTEXT_LENGTH
     input_prefill = (
-        torch.randint(0, 1000, (1, )).to(torch.int64),  # len seq length
+        tokens,
         torch.arange(position, position + 1), # input indexes
         torch.arange(position - CONTEXT_LENGTH, position), # context indexes
         caches, # caches
@@ -269,5 +272,5 @@ def load_stablehlo_model(checkpoint_dir, model_dir):
             checkpoint = shlo._bundle.state_dict
         else:
             checkpoint = make_random_checkpoint(shlo._bundle)
-    caches = make_cache(model_arg)
+    caches = make_cache(model_arg, metadata['batch_size'])
     return Llama2StableHLO(checkpoint, shlo), caches
