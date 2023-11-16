@@ -1,3 +1,5 @@
+import functools
+import time
 import collections
 import torch
 import jax
@@ -89,7 +91,7 @@ def verify_cache(caches, model1):
 
 def get_arg(param_size, seqlen):
     if param_size == 'tiny':
-        data = {"dim": 128, "multiple_of": 32, "n_heads": 2, "n_layers": 3, "norm_eps": 1e-05, "vocab_size": -1}
+        data = {"dim": 128, "multiple_of": 32, "n_heads": 4, "n_layers": 3, "norm_eps": 1e-05, "vocab_size": -1}
     elif param_size == '7b':
         data = {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-05, "vocab_size": -1}
     elif param_size == '13b':
@@ -380,6 +382,18 @@ class JaxTensor(torch.Tensor):
 
     __torch_function__ = torch._C._disabled_torch_function_impl
 
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        #print('running...', func.name())
+        args = tree_map(make_jax_array, args)
+        kwargs = tree_map(make_jax_array, kwargs)
+        res = get_function(func.name())(*args, **kwargs)
+        # run_torch_and_diff(func, args, kwargs, res)
+        if func.name() == 'aten::copy_':
+            args[0]._elem = res
+            return args[0]
+        return JaxTensor(res)
+
 
 class PrintingMode(TorchDispatchMode):
   def __torch_dispatch__(self, func, types, args=(), kwargs=None):
@@ -434,10 +448,29 @@ class JaxMode(TorchDispatchMode):
         return args[0]
     return JaxTensor(res)
 
+from jax.experimental import mesh_utils
+from jax.sharding import PositionalSharding
+sharding = PositionalSharding(mesh_utils.create_device_mesh((4, )))
+shardings = [sharding.reshape(4, 1), sharding.reshape(1, 4)]
+
+
+def wrap_weights_sharded(rev_state_dict, module):
+    for k, v in module.__dict__.items():
+        if isinstance(v, torch.Tensor) and not isinstance(v, JaxTensor):
+            name = rev_state_dict.get(id(v))
+            print(id(v), name, k, module)
+            axis = _shard_axis(name)
+            jax_arr = jnp.array(v.detach().cpu().numpy())
+            if axis is not None:
+                print('shared', name, 'at', axis)
+                jax_arr = jax.device_put(jax_arr, shardings[axis])
+            setattr(module, k, JaxTensor(jax_arr))
+
 def wrap_weights(module):
     for k, v in module.__dict__.items():
         if isinstance(v, torch.Tensor) and not isinstance(v, JaxTensor):
-            setattr(module, k, JaxTensor(jnp.array(v.detach().cpu().numpy())))
+            jax_arr = jnp.array(v.detach().cpu().numpy())
+            setattr(module, k, JaxTensor(jax_arr))
 
 
 def run_llama2_test_jit():
@@ -552,6 +585,29 @@ _State = collections.namedtuple(
     ],
 )
 
+def _shard_axis(name):
+    if name is None:
+        return None
+    if 'tok_embeddings' in name:
+        return 0
+    if 'attention.' in name:
+      if 'wo' in name:
+          return 0
+        #position_to_sharding[i] = (_NUM_OF_PARTITIONS.value, 1)
+      else:
+          return 1
+       # position_to_sharding[i] = (1, _NUM_OF_PARTITIONS.value)
+    if 'feed_forward.' in name:
+      if 'w2' in name:
+          return 0
+       # position_to_sharding[i] = (_NUM_OF_PARTITIONS.value, 1)
+      else:
+          return 1
+      #  position_to_sharding[i] = (1, _NUM_OF_PARTITIONS.value)
+    if 'output' in name:
+        return 1
+      #position_to_sharding[i] = (1, _NUM_OF_PARTITIONS.value)
+
 
 def run_llama_benchmark():
     param_size = 'tiny'
@@ -569,29 +625,49 @@ def run_llama_benchmark():
 
     start = time.time()
     m_jax = model2.Transformer(model_arg)
+    end = time.time()
+    print('instantiated model', end - start)
+    start = time.time()
     m_jax.eval()
 
-    m_jax.apply(wrap_weights)
+    state_dict = m_jax.state_dict()
+    wrapped_dict = {}
+    for k, v in state_dict.items():
+        print(k, v.shape)
+        if isinstance(v, torch.Tensor) and not isinstance(v, JaxTensor):
+            axis = _shard_axis(k)
+            jax_arr = jnp.array(v.detach().cpu().numpy())
+            if axis is not None:
+                print('shared', k, 'at', axis)
+                jax_arr = jax.device_put(jax_arr, shardings[axis])
+            wrapped_dict[k] = JaxTensor(jax_arr)
 
-
-    end = time.time()
-
+    m_jax.load_state_dict(wrapped_dict, strict=False, assign=True)
     caches = make_cache_jax(model_arg, 1)
+                # manually shard the kv cache
+                
+    sharded_caches = []
+    for ck, cv in caches:
+        sharded_caches.append((
+            jax.device_put(ck, sharding.reshape(1,1,4,1)),
+            jax.device_put(cv, sharding.reshape(1,1,4,1))
+        ))
 
     mask = jnp.full((1, 1, context_length, context_length), -jnp.inf)
     mask = jnp.triu(mask, k=1)
+    print('set up things', end - start)
 
     # takes jax array, returns jax array
     def run_jax_model(args, caches):
         for (cache_k, cache_v), layer in zip(caches, m_jax.layers):
             layer.attention.cache_k = JaxTensor(cache_k)
             layer.attention.cache_v = JaxTensor(cache_v)
-        with JaxMode():
-            jt = tuple(JaxTensor(a) if isinstance(a, jnp.ndarray) else a for a in args )
-            res = m_jax(*jt)._elem
-            caches = [(layer.attention.cache_k._elem, 
-                       layer.attention.cache_v._elem) for layer in m_jax.layers]
-            return res, caches
+
+        jt = tuple(JaxTensor(a) if isinstance(a, jnp.ndarray) else a for a in args )
+        res = m_jax(*jt)._elem
+        caches = [(layer.attention.cache_k._elem, 
+                   layer.attention.cache_v._elem) for layer in m_jax.layers]
+        return res, caches
 
 
     def run_loop(orig_inputs, caches):
@@ -634,14 +710,23 @@ def run_llama_benchmark():
     orig_inputs = jnp
 
     key = jrandom.PRNGKey(0)
-    random_integers = jrandom.randint(key, (1, 2048,), 0, 32000)
-    print(jax.jit(run_loop)(random_integers, caches))
+    jit_func = jax.jit(run_loop)
+
+    for i in range(3):
+        print('Iteration start', i)
+        random_integers = jrandom.randint(key, (1, 2048,), 0, 32000)
+        start = time.time()
+        res = jit_func(random_integers, sharded_caches)
+        end = time.time()
+        print('Iteration ', i, end - start)
 
 
 if __name__ == '__main__':
+    '''
     print('--- eager and jit ---')
     run_llama2_test_jit()
     print('--- eager only ---')
     run_llama2_test_eager()
-    #print('benchmark')
-    #run_llama_benchmark()
+    '''
+    print('benchmark')
+    run_llama_benchmark()

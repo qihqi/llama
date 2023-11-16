@@ -9,6 +9,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+USE_FOR_LOOP_FOR_LAYERS = False
+USE_PALLAS_FLASH_ATTENTION = False
+
 
 
 @dataclass

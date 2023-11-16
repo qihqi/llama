@@ -435,7 +435,7 @@ class Transformer(nn.Module):
     def forward(self, tokens: torch.Tensor, indexes, cache_indexes, mask):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
+        # self.freqs_cis = self.freqs_cis.to(h.device)
         # freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         # indexes = torch.arange(start_pos, start_pos + seqlen)
         freqs_cis = torch.index_select(self.freqs_cis, 0, indexes)
