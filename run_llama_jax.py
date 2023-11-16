@@ -1,7 +1,9 @@
+import collections
 import torch
 import jax
 # from torch_xla import stablehlo
 import numpy as np
+import jax.random as jrandom
 
 import json
 import os
@@ -43,6 +45,27 @@ def make_cache(args):
                 args.max_seq_len,
                 n_local_kv_heads,
                 head_dim,
+            )))
+    return res
+
+def make_cache_jax(args, max_batch_size):
+    n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+    n_local_heads = args.n_heads
+    n_local_kv_heads = n_kv_heads
+    n_rep = n_local_heads // n_local_kv_heads
+    head_dim = args.dim // args.n_heads
+    res = []
+    for i in range(args.n_layers):
+        res.append((jnp.zeros (
+                (max_batch_size,
+                args.max_seq_len,
+                n_local_kv_heads,
+                head_dim,)
+            ), jnp.zeros (
+                (max_batch_size,
+                args.max_seq_len,
+                n_local_kv_heads,
+                head_dim,)
             )))
     return res
 
@@ -506,7 +529,7 @@ def run_llama2_test_eager():
 
     end = time.time()
     caches = make_cache(model_arg)
-     
+
     sample_input_prefill = (
         torch.randint(0, 1000, (2, context_length, )),  # len seq length
         0,
@@ -518,9 +541,107 @@ def run_llama2_test_eager():
 
     print('DIFF', (result_torch - torch.from_numpy(np.array(result_jax._elem))).norm())
 
+_State = collections.namedtuple(
+    'State',
+    [
+        'res',
+        'caches',
+        'input_tokens',
+        'index',
+        'cache_index',
+    ],
+)
+
+
+def run_llama_benchmark():
+    param_size = 'tiny'
+    context_length = 2048
+    infer_length = 128
+
+    print('start')
+
+    tokenizer = Tokenizer(model_path=tokenizer_path)
+    assert param_size in ('tiny', '7b', '13b', '70b'), param_size
+    max_input_seq_length = context_length + infer_length
+
+    model_arg = get_arg(param_size, max_input_seq_length)
+    model_arg.vocab_size = tokenizer.n_words
+
+    start = time.time()
+    m_jax = model2.Transformer(model_arg)
+    m_jax.eval()
+
+    m_jax.apply(wrap_weights)
+
+
+    end = time.time()
+
+    caches = make_cache_jax(model_arg, 1)
+
+    mask = jnp.full((1, 1, context_length, context_length), -jnp.inf)
+    mask = jnp.triu(mask, k=1)
+
+    # takes jax array, returns jax array
+    def run_jax_model(args, caches):
+        for (cache_k, cache_v), layer in zip(caches, m_jax.layers):
+            layer.attention.cache_k = JaxTensor(cache_k)
+            layer.attention.cache_v = JaxTensor(cache_v)
+        with JaxMode():
+            jt = tuple(JaxTensor(a) if isinstance(a, jnp.ndarray) else a for a in args )
+            res = m_jax(*jt)._elem
+            caches = [(layer.attention.cache_k._elem, 
+                       layer.attention.cache_v._elem) for layer in m_jax.layers]
+            return res, caches
+
+
+    def run_loop(orig_inputs, caches):
+        prefill_input = (
+            orig_inputs,
+            jnp.arange(0, context_length),
+            jnp.arange(0, context_length),
+            mask)
+
+        logits, caches = run_jax_model(prefill_input, caches)
+        next_token = jnp.argmax(logits[0][-1]).reshape((1,))
+
+        def body(state):
+            decode_input = (
+                state.input_tokens.reshape( (1, 1)),
+                state.index,
+                state.cache_index,
+                None,
+            )
+            logits, caches = run_jax_model(decode_input, state.caches)
+            next_token = jnp.argmax(logits[0][-1]).reshape((1,))
+            res = state.res.at[state.index - context_length].set(next_token[0])
+            return _State(res, caches, next_token, state.index + 1, state.cache_index + 1)
+
+        def condition(states):
+            return states.index[-1] < infer_length  + context_length
+
+        results = jnp.zeros((infer_length, )).astype(jnp.int64)
+        results = results.at[0].set(next_token[0])
+        start = _State(
+            results,
+            caches,
+            next_token,
+            jnp.arange(1 + context_length, context_length + 2),
+            jnp.arange(2, 2 + context_length),
+        )
+
+        return jax.lax.while_loop(condition, body, start).res
+
+    orig_inputs = jnp
+
+    key = jrandom.PRNGKey(0)
+    random_integers = jrandom.randint(key, (1, 2048,), 0, 32000)
+    print(jax.jit(run_loop)(random_integers, caches))
+
 
 if __name__ == '__main__':
     print('--- eager and jit ---')
     run_llama2_test_jit()
     print('--- eager only ---')
     run_llama2_test_eager()
+    #print('benchmark')
+    #run_llama_benchmark()
