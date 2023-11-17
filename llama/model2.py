@@ -225,7 +225,7 @@ class Attention(nn.Module):
             bias=False,
         )
 
-        self.cache_k = torch.zeros(
+        cache_k = torch.zeros(
             (
                 args.max_batch_size,
                 args.max_seq_len,
@@ -233,7 +233,8 @@ class Attention(nn.Module):
                 self.head_dim,
             )
         )
-        self.cache_v = torch.zeros(
+        self.register_buffer('cache_k', cache_k)
+        cache_v = torch.zeros(
             (
                 args.max_batch_size,
                 args.max_seq_len,
@@ -241,6 +242,7 @@ class Attention(nn.Module):
                 self.head_dim,
             )
         )
+        self.register_buffer('cache_v', cache_v)
 
     def forward(
         self,
@@ -399,6 +401,8 @@ class TransformerBlock(nn.Module):
         return out
 
 
+
+
 class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
         """
@@ -437,19 +441,21 @@ class Transformer(nn.Module):
             # make one layer
             # but make the weights replicated
             self._layer = TransformerBlock(0, params)
+            self._layer.eval()
             state_dict = self._layer.state_dict()
             self._keys = list(state_dict.keys())
-            self._layer_weights = [
-                torch.stack([state_dict[k]] * params.n_layers)
-                for k in self._keys]
+            for k in self._keys:
+                weights = torch.stack([state_dict[k]] * params.n_layers)
+                self.register_buffer(k.replace('.', '___'), weights)
         else:
             self.layers = torch.nn.ModuleList()
             for layer_id in range(params.n_layers):
                 self.layers.append(TransformerBlock(layer_id, params))
 
     def _call_one_layer(self, i, args):
-        state_dict = {key: JaxTensor(val._elem[i]) 
-            for key, val in zip(self._keys, self._layer_weights)}
+        state_dict = {key: JaxTensor(getattr(self, key.replace('.', '___'))._elem[i]) 
+            for key in self._keys}
+        state_dict = {key: torch.nn.Parameter(val) if 'cache' not in key else val for key, val in state_dict.items()}
         self._layer.load_state_dict(state_dict, False, True)
         res = self._layer(*args)
         return res
@@ -466,6 +472,7 @@ class Transformer(nn.Module):
             def one_loop(i, h_jax):
                 # h is jax
                 return self._call_one_layer(i, (JaxTensor(h_jax), indexes, cache_indexes, freqs_cis, mask))._elem.astype(jnp.bfloat16)
+            h._elem = h._elem.astype(jnp.bfloat16)
             h = jax.lax.fori_loop(0, self.params.n_layers, one_loop, h._elem)
             h = JaxTensor(h)
         else:

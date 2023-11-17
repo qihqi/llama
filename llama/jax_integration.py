@@ -341,3 +341,50 @@ class JaxMode(TorchDispatchMode):
         args[0]._elem = res
         return args[0]
     return JaxTensor(res)
+
+
+def make_jax_loop(model_arg, model_prefill, model_decode):
+
+    # weight include caches?
+    def run_loop(weights, orig_inputs):
+        # make cache here?
+
+        prefill_input = (
+            orig_inputs,
+            jnp.arange(0, context_length),
+            jnp.arange(0, context_length),
+            mask,
+            freqs)
+
+        logits, caches = model_prefill(weights, prefill_input)
+
+        next_token = jnp.argmax(logits[0][-1]).reshape((1,))
+
+        def body(state):
+            decode_input = (
+                state.input_tokens.reshape( (1, 1)),
+                state.index,
+                state.cache_index,
+                None,
+                freqs,
+            )
+            logits, caches = model_decode(weights, decode_input)
+            next_token = jnp.argmax(logits[0][-1]).reshape((1,))
+            res = state.res.at[state.index - context_length].set(next_token[0])
+            return _State(res, caches, next_token, state.index + 1, state.cache_index + 1)
+
+        def condition(states):
+            return states.index[-1] < infer_length  + context_length
+
+        results = jnp.zeros((infer_length, )).astype(jnp.int64)
+        results = results.at[0].set(next_token[0])
+        start = _State(
+            results,
+            caches,
+            next_token,
+            jnp.arange(1 + context_length, context_length + 2),
+            jnp.arange(2, 2 + context_length),
+        )
+
+        return jax.lax.while_loop(condition, body, start).res
+    return run_loop

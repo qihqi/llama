@@ -2,6 +2,7 @@ import functools
 import time
 import collections
 import torch
+from torch._functorch.make_functional import make_functional_with_buffers
 import jax
 # from torch_xla import stablehlo
 import numpy as np
@@ -244,7 +245,7 @@ _State = collections.namedtuple(
     'State',
     [
         'res',
-        'caches',
+        'cache',
         'input_tokens',
         'index',
         'cache_index',
@@ -276,11 +277,12 @@ def _shard_axis(name):
 
 
 def run_llama_benchmark():
-    param_size = '7b'
+    param_size = 'tiny'
     context_length = 2048
     infer_length = 128
 
-    model2.use_jax_loop = False
+    model2.use_jax_loop = True 
+    use_spmd = True
 
     print('start')
 
@@ -291,107 +293,85 @@ def run_llama_benchmark():
     model_arg = get_arg(param_size, max_input_seq_length)
     model_arg.vocab_size = tokenizer.n_words
 
-    # model_arg.n_layers = 4
+    model_arg.n_layers = 10
 
     start = time.time()
     m_jax = model2.Transformer(model_arg)
-    end = time.time()
-    print('instantiated model', end - start)
-    start = time.time()
     m_jax.eval()
 
-    state_dict = m_jax.state_dict()
-    weights = {}
+    freqs = jnp.array(m_jax.freqs_cis.cpu().detach().numpy())
+    m_jax, weights, buffers = make_functional_with_buffers(m_jax)
+    m_jax.eval()
 
-    for k, v in state_dict.items():
-        print(k, v.shape)
-        if isinstance(v, torch.Tensor) and not isinstance(v, JaxTensor):
-            axis = _shard_axis(k)
-            jax_arr = jnp.array(v.detach().cpu().numpy()).astype(jnp.bfloat16)
-            if axis is not None:
-                print('shared', k, 'at', axis)
-                jax_arr = jax.device_put(jax_arr, shardings[axis])
-            weights[k] = jax_arr
+    def make_model_jax(model):
 
-    if model2.use_jax_loop:
-        new_layer_weights = []
-        for k, v in zip(m_jax._keys, m_jax._layer_weights):
-            if isinstance(v, torch.Tensor) and not isinstance(v, JaxTensor):
-                axis = _shard_axis(k)
-                jax_arr = jnp.array(v.detach().cpu().numpy()).astype(jnp.bfloat16)
-                if axis is not None:
-                    print('shared', k, 'at', axis)
-                    local_sharding = shardings[axis]
-                    local_sharding = local_sharding.reshape((1, ) + local_sharding.shape)
-                    jax_arr = jax.device_put(jax_arr, local_sharding)
-                new_layer_weights.append(jax_arr)
-        layer_weights = new_layer_weights
-    else:
-        layer_weights = []
+        def jax_callable(weights, buffers, args):
+            weights = tree_map(JaxTensor, weights)
+            buffers = tree_map(JaxTensor, buffers)
+            args = tree_map(JaxTensor, args)
+            res = model(weights, buffers, *args)
+            unwrap_buffers = tuple(buf._elem for buf in buffers)
+            if isinstance(res, tuple):
+                return tuple(r._elem if isinstance(r, JaxTensor) else r for r in res), unwrap_buffers
+            else:
+                return res._elem, unwrap_buffers
+        return jax_callable
 
-    caches = make_cache_jax(model_arg, 1)
-                # manually shard the kv cache
-                
-    if model2.use_jax_loop:
-        args = model_arg
-        n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        n_local_heads = args.n_heads
-        n_local_kv_heads = n_kv_heads
-        n_rep = n_local_heads // n_local_kv_heads
-        head_dim = args.dim // args.n_heads
-        caches = (jnp.zeros (
-                (model_arg.n_layers, 
-                    1,
-                args.max_seq_len,
-                n_local_kv_heads,
-                head_dim,)
-            ), jnp.zeros(
-                (model_arg.n_layers, 
-                1,
-                args.max_seq_len,
-                n_local_kv_heads,
-                head_dim,)
-            ))
-        sharded_caches = (
-                jax.device_put(caches[0], sharding.reshape(1, 1, 1, 4, 1)),
-                jax.device_put(caches[1], sharding.reshape(1, 1, 1, 4, 1)),
-            )
-    else:
-        sharded_caches = []
-        for ck, cv in caches:
-            sharded_caches.append((
-                jax.device_put(ck, sharding.reshape(1,1,4,1)),
-                jax.device_put(cv, sharding.reshape(1,1,4,1))
-            ))
-        del caches
+    def make_jax_array(t):
+        if isinstance(t, torch.Tensor):
+            return jnp.array(t.detach().cpu().numpy()).astype(jnp.bfloat16)
+        return t
+
+
+
+    m_jax_func = make_model_jax(m_jax)
+    jitted = jax.jit(m_jax_func)
+    jax_weights = tree_map(make_jax_array, weights)
+    jax_buffers = tree_map(make_jax_array, buffers)
 
     mask = jnp.full((1, 1, context_length, context_length), -jnp.inf)
     mask = jnp.triu(mask, k=1)
-    print('set up things', end - start)
+    args = (
+        jnp.arange(0, 2048).reshape((1, 2048)),
+        jnp.arange(0, context_length),
+        jnp.arange(0, context_length),
+        mask,
+        freqs
+    )
 
-    # takes jax array, returns jax array
-    def run_jax_model(args, caches, weights, layer_weights):
-        if model2.use_jax_loop:
-            weights = tree_map(JaxTensor, weights)
-            layer_weights = tree_map(JaxTensor, layer_weights)
-            m_jax.load_state_dict(weights, False, True)
-            m_jax._layer_weights = layer_weights
-        else:
-            for (cache_k, cache_v), layer in zip(caches, m_jax.layers):
-                layer.attention.cache_k = JaxTensor(cache_k)
-                layer.attention.cache_v = JaxTensor(cache_v)
-
-        jt = tuple(JaxTensor(a) if isinstance(a, jnp.ndarray) else a for a in args )
-        res = m_jax(*jt)._elem
-        if model2.use_jax_loop:
-            pass
-        else:
-            caches = [(layer.attention.cache_k._elem, 
-                       layer.attention.cache_v._elem) for layer in m_jax.layers]
-        return res, caches
+    print(jitted.lower(jax_weights, jax_buffers, args).as_text())
 
 
-    def run_loop(orig_inputs, caches, freqs, weights, layer_weights):
+    if use_spmd:
+        jax_weights_new = []
+        jax_buffers_new = []
+        num_devices = len(jax.devices())
+        for name, jax_arr in zip(m_jax.param_names, jax_weights):
+            axis = _shard_axis(name)
+            if axis is not None:
+                print('shared', name, 'at', axis)
+                this_sharding = shardings[axis]
+                if len(jax_arr.shape) > len(this_sharding.shape):
+                    this_sharding = this_sharding.reshape((1, *this_sharding.shape))
+                jax_arr = jax.device_put(jax_arr, this_sharding) 
+            jax_weights_new.append(jax_arr)
+            
+        for name, jax_arr in zip(m_jax.buffer_names, jax_buffers):
+            if 'cache' in name:
+                print('shared', name, 'at', axis)
+                this_sharding = sharding.reshape(1, 1, num_devices, 1)
+                if len(jax_arr.shape) > len(this_sharding.shape):
+                    this_sharding = this_sharding.reshape((1, *this_sharding.shape))
+                jax_arr = jax.device_put(jax_arr, this_sharding)
+            jax_buffers_new.append(jax_arr)
+
+        jax_weights = jax_weights_new
+        del jax_weights_new
+        jax_buffers = jax_buffers_new
+        del jax_buffers_new
+
+
+    def run_loop(orig_inputs, freqs, mask, jax_weights, jax_buffers):
         prefill_input = (
             orig_inputs,
             jnp.arange(0, context_length),
@@ -399,7 +379,7 @@ def run_llama_benchmark():
             mask,
             freqs)
 
-        logits, caches = run_jax_model(prefill_input, caches, weights, layer_weights)
+        logits, jax_buffers = jitted(jax_weights, jax_buffers, prefill_input)
         next_token = jnp.argmax(logits[0][-1]).reshape((1,))
 
         def body(state):
@@ -410,19 +390,20 @@ def run_llama_benchmark():
                 None,
                 freqs,
             )
-            logits, caches = run_jax_model(decode_input, state.caches, weights, layer_weights)
+            logits, new_cache = jitted(jax_weights, state.cache, prefill_input)
             next_token = jnp.argmax(logits[0][-1]).reshape((1,))
             res = state.res.at[state.index - context_length].set(next_token[0])
-            return _State(res, caches, next_token, state.index + 1, state.cache_index + 1)
+            return _State(res, new_cache, next_token, state.index + 1, state.cache_index + 1)
 
         def condition(states):
             return states.index[-1] < infer_length  + context_length
 
         results = jnp.zeros((infer_length, )).astype(jnp.int64)
         results = results.at[0].set(next_token[0])
+        cache = jax_buffers
         start = _State(
             results,
-            caches,
+            cache, 
             next_token,
             jnp.arange(1 + context_length, context_length + 2),
             jnp.arange(2, 2 + context_length),
@@ -436,15 +417,14 @@ def run_llama_benchmark():
     jit_func = jax.jit(run_loop, in_shardings=None, out_shardings=None)
 
     random_integers = jrandom.randint(key, (1, 2048,), 0, 32000)
-    freqs = jnp.array(m_jax.freqs_cis.cpu().detach().numpy())
-   # print(jit_func.lower(random_integers, sharded_caches, freqs, weights, layer_weights).as_text())
+    # print(jit_func.lower(random_integers, sharded_caches, freqs, weights, layer_weights).as_text())
 
 
     for i in range(3):
         print('Iteration start', i)
         random_integers = jrandom.randint(key, (1, 2048,), 0, 32000)
         start = time.time()
-        res = jit_func(random_integers, sharded_caches, freqs, weights, layer_weights)
+        res = jit_func(random_integers, freqs, mask, jax_weights, jax_buffers)
         end = time.time()
         print('Iteration ', i, end - start)
     print(res)
