@@ -23,6 +23,7 @@ from llama import model2
 from llama import model
 from llama.tokenizer import Tokenizer
 from jax import numpy as jnp
+from llama.jax_integration import *
 
 tokenizer_path = 'tokenizer.model'
 
@@ -112,341 +113,6 @@ def get_arg(param_size, seqlen):
         max_batch_size=2,
         **data,
     )
-_lowerings = {}
-def register(name):
-    def inner(func):
-        global _lowerings
-        _lowerings[name] = func
-        return func
-    return inner
-
-
-def _get_numpy_dtype(dtype):
-  return {
-      torch.double: jnp.double,
-      torch.float32: jnp.float32,
-      #torch.half: jnp.half,
-      torch.long: jnp.int64,
-      torch.int32: jnp.int32,
-      torch.int16: jnp.int16,
-      torch.bool: jnp.bool_,
-  }.get(dtype)
-
-@register("aten::view")
-@register("aten::_unsafe_view")
-def _aten_unsafe_view(x, shape):
-    return jnp.reshape(x, shape)
-
-@register("aten::add")
-def _aten_add(x, y):
-    return x + y
-
-@register("aten::copy_")
-def _aten_copy(x, y, memory_format=None):
-    return jnp.copy(y)
-
-@register("aten::clone")
-def _aten_clone(x, memory_format=None):
-    return jnp.copy(x)
-
-@register("aten::full")
-def _aten_full(size, value, **kwargs):
-    return jnp.full(size, value)
-
-@register("aten::index_copy")
-def _aten_index_copy(x, dim, indexes, source):
-    # return jax.lax.scatter(x, index, dim)
-    dims = []
-    for i in range(len(x.shape)):
-        if i == dim:
-            dims.append(indexes)
-        else:
-            dims.append(slice(None, None, None))
-    return x.at[dim].set(source)
-
-@register("aten::index_select")
-def _aten_index_select(x, dim, indexes):
-    """
-    slice_sizes = list(x.shape)
-    slice_sizes[dim] = 1
-    indexes = jnp.append(indexes, 1)
-    offset_dims = [i for i in range(len(x.shape)) if i != dim]
-    gather_dnums = jax.lax.GatherDimensionNumbers(
-        offset_dims=(dim, ),
-        collapsed_slice_dims=(dim, ),
-        start_index_map=(dim, ),
-    )
-    return jax.lax.gather(x, indexes, gather_dnums, tuple(slice_sizes))
-    """
-    dims = []
-    for i in range(len(x.shape)):
-        if i == dim:
-            dims.append(indexes)
-        else:
-            dims.append(slice(None, None, None))
-    return x[tuple(dims)]
-
-@register("aten::mean")
-def _aten_mean(x, dim, keepdim):
-    return jnp.mean(x, dim, keepdims=keepdim)
-
-@register("aten::mm")
-def _aten_mm(x, y):
-    return x @ y
-
-@register("aten::mul")
-def _aten_mul(x, y):
-    return x * y
-
-@register("aten::silu")
-def _aten_silu(x):
-    return jax.nn.silu(x)
-
-@register("aten::t")
-def _aten_t(x):
-    return jnp.transpose(x)
-    
-@register("aten::transpose")
-def _aten_transpose(x, dim0, dim1):
-    shape = list(range(len(x.shape)))
-    shape[dim0], shape[dim1] = shape[dim1], shape[dim0]
-    return jnp.transpose(x, shape)
-
-@register("aten::triu")
-def _aten_triu(m, k):
-    return jnp.triu(m, k)
-
-@register("aten::slice")
-def _aten_slice(self, dim=0, start=None, end=None, step=1):
-    sl = slice(start, end, step)
-    dims = []
-    for i in range(len(self.shape)):
-        if i == dim:
-            dims.append(sl)
-        else:
-            dims.append(slice(None, None, None))
-    return self[tuple(dims)]
-
-@register("aten::detach")
-def _aten_detach(self):
-    return self
-
-
-
-@register("aten::view_as_real")
-def _aten_view_as_real(x):
-    real = jnp.real(x)
-    im = jnp.imag(x)
-    res = jnp.stack([real, im], -1)
-    return res
-
-
-@register('aten::_softmax')
-def _aten_softmax(x, dim, halftofloat):
-    return jax.nn.softmax(x, dim)
-
-
-@register('aten::pow')
-def _aten_pow(x, y):
-  if isinstance(y, int):
-    y = float(y)
-  if isinstance(y, jnp.ndarray):
-    y = y.astype(jnp.float32)
-  return jax.lax.pow(x, y)
-
-@register('aten::view_as_complex')
-def _aten_view_as_complex(input):
-  x, y = input[..., 0], input[..., 1]
-  return jax.lax.complex(x, y)
-
-@register('aten::div')
-def _aten_div(x, y):
-  return x / y
-
-@register('aten::bmm')
-def _aten_bmm(x, y):
-  return jnp.einsum('bnm,bmk->bnk', x, y)
-
-@register('aten::embedding')
-def _aten_embedding(a, w):
-  return jnp.take(a, w, axis=0)
-
-@register('aten::rsqrt')
-def _aten_rsqrt(x):
-  return jax.lax.rsqrt(x)
-
-@register('aten::expand')
-def _aten_expand(x, dims):
-    return jnp.broadcast_to(x, dims)
-
-@register('aten::dot')
-def _aten_dot(x, y):
-    return jnp.dot(x, y)
-
-@register('aten::_to_copy')
-def _aten__to_copy(tensor, **kwargs):
-    dtype = _get_numpy_dtype(kwargs['dtype'])
-    if dtype != tensor.dtype:
-        return tensor.astype(dtype)
-    return jnp.copy(tensor)
-
-
-@register('aten::empty')
-def _aten_empty(sizes, **kwargs):
-    return jnp.zeros(sizes)
-
-@register('aten::index_put_')
-def _aten_index_put(self, indexes, values):
-    indexes = [
-        slice(None, None, None) if i is None
-        else i
-        for i in indexes
-    ]
-    indexes = tuple(indexes)
-    return self.at[indexes].set(values)
-
-@register('aten::index')
-def _aten_index(self, indexes):
-    indexes = [
-        slice(None, None, None) if i is None
-        else i
-        for i in indexes
-    ]
-    indexes = tuple(indexes)
-    return self[indexes]
-
-
-
-
-def get_function(name):
-    name = name.split('.')[0]
-    return _lowerings[name]
-
-
-from torch.utils._python_dispatch import TorchDispatchMode
-
-def make_jax_array(tensor):
-    if isinstance(tensor, JaxTensor):
-        return tensor._elem
-    if isinstance(tensor, torch.Tensor):
-        tensor = tensor.detach()
-        if hasattr(tensor, '_elem'):
-            return tensor._elem
-        return jnp.array(tensor.numpy())
-    return tensor
-    # TODO use dlpack
-
-
-import torch
-
-# All of the tensor examples in this zoo inherit from BaseTensor.  Ideally,
-# however, they would inherit directly from Tensor.  This is just our staging
-# ground for applying behavior that hasn't yet made it into core but that
-# we would like to apply by default.
-class JaxTensor(torch.Tensor):
-    # See https://github.com/pytorch/pytorch/pull/73727 ; this is necessary
-    # to ensure that super().__new__ can cooperate with each other
-    @staticmethod
-    def __new__(cls, elem):
-        return torch.Tensor._make_subclass(
-            cls,
-            torch.empty(elem.shape, dtype=torch.float32, device="meta"),
-            require_grad=False,
-        )
-
-    def __init__(self, elem):
-        super().__init__()
-        self._elem = elem
-
-    def __str__(self):
-        return 'Tensor backed by Jax ' + str(self._elem)
-
-
-    @property
-    def shape(self):
-        return self._elem.shape
-
-    @property
-    def ndim(self):
-        return len(self._elem.shape)
-
-    def flatten(self, start_dim=0, end_dim=-1):
-        if end_dim == -1:
-            end_dim = self.ndim
-        new_shape = self.shape[:start_dim] + (-1,) + self.shape[end_dim:]
-        return torch.reshape(self, new_shape)
-
-    def __setitem__(self, key, val):
-        key = tuple(make_jax_array(k) if isinstance(k, torch.Tensor) else k for k in key)
-        self._elem = self._elem.at[key].set(val._elem)
-
-    __torch_function__ = torch._C._disabled_torch_function_impl
-
-    @classmethod
-    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        #print('running...', func.name())
-        args = tree_map(make_jax_array, args)
-        kwargs = tree_map(make_jax_array, kwargs)
-        res = get_function(func.name())(*args, **kwargs)
-        # run_torch_and_diff(func, args, kwargs, res)
-        if func.name() == 'aten::copy_':
-            args[0]._elem = res
-            return args[0]
-        return JaxTensor(res)
-
-
-class PrintingMode(TorchDispatchMode):
-  def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-    print(func.name())
-    return func(*args, **kwargs)
-
-class VerifyMode(TorchDispatchMode):
-
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        jax_args = tree_map(make_jax_array, args)
-        jax_kwargs = tree_map(make_jax_array, kwargs)
-        jax_res = get_function(func.name())(*jax_args, **jax_kwargs)
-        torch_res = func(*args, **kwargs)
-        print(func.name())
-        jax_res_t = torch.from_numpy(np.array(jax_res))
-        if not torch.allclose(torch_res, torch.from_numpy(np.array(jax_res)), atol=1e-4):
-            print('FAIL', func.name(), (torch_res - jax_res_t).norm())
-        else:
-            print('... passes')
-        return torch_res
-
-
-def run_torch_and_diff(func, args, kwargs, res):
-    def to_torch(x):
-        if isinstance(x, jnp.ndarray):
-            return torch.from_numpy(np.array(x))
-        return x
-    args = tree_map(to_torch, args)
-    kwargs = tree_map(to_torch, kwargs)
-    if func.name() == 'aten::view':
-        torch_res = args[0].reshape(args[1])
-    else:
-        torch_res = func(*args, **kwargs)
-    res = to_torch(res)
-    print(func.name(), end=' ')
-    if torch.allclose(torch_res, res, atol=1e-3):
-        print('pass')
-    else:
-        print('fail')
-    
-
-
-class JaxMode(TorchDispatchMode):
-  def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-    # print('running...', func.name())
-    args = tree_map(make_jax_array, args)
-    kwargs = tree_map(make_jax_array, kwargs)
-    res = get_function(func.name())(*args, **kwargs)
-    # run_torch_and_diff(func, args, kwargs, res)
-    if func.name() == 'aten::copy_':
-        args[0]._elem = res
-        return args[0]
-    return JaxTensor(res)
 
 from jax.experimental import mesh_utils
 from jax.sharding import PositionalSharding
@@ -614,6 +280,8 @@ def run_llama_benchmark():
     context_length = 2048
     infer_length = 128
 
+    model2.use_jax_loop = True
+
     print('start')
 
     tokenizer = Tokenizer(model_path=tokenizer_path)
@@ -643,6 +311,20 @@ def run_llama_benchmark():
             wrapped_dict[k] = JaxTensor(jax_arr)
 
     m_jax.load_state_dict(wrapped_dict, strict=False, assign=True)
+    if model2.use_jax_loop:
+        new_layer_weights = []
+        for k, v in zip(m_jax._keys, m_jax._layer_weights):
+            if isinstance(v, torch.Tensor) and not isinstance(v, JaxTensor):
+                axis = _shard_axis(k)
+                jax_arr = jnp.array(v.detach().cpu().numpy())
+                if axis is not None:
+                    print('shared', k, 'at', axis)
+                    local_sharding = shardings[axis]
+                    local_sharding = local_sharding.reshape((1, ) + local_sharding.shape)
+                    jax_arr = jax.device_put(jax_arr, local_sharding)
+                new_layer_weights.append(JaxTensor(jax_arr))
+        m_jax._layer_weights = new_layer_weights
+
     caches = make_cache_jax(model_arg, 1)
                 # manually shard the kv cache
                 

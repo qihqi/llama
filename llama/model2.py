@@ -8,6 +8,11 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
+import jax
+from llama.jax_integration import JaxTensor
+
+use_jax_loop = False
+use_jax_mha = False
 
 
 
@@ -431,6 +436,26 @@ class Transformer(nn.Module):
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
+        if use_jax_loop:
+            # make one layer
+            # but make the weights replicated
+            self._layer = TransformerBlock(0, params)
+            state_dict = self._layer.state_dict()
+            self._keys = list(state_dict.keys())
+            self._layer_weights = [
+                torch.stack([state_dict[k]] * params.n_layers)
+                for k in self._keys]
+        else:
+            self.layers = torch.nn.ModuleList()
+            for layer_id in range(params.n_layers):
+                self.layers.append(TransformerBlock(layer_id, params))
+
+    def _call_one_layer(self, i, args):
+        state_dict = {key: JaxTensor(val._elem[i]) 
+            for key, val in zip(self._keys, self._layer_weights)}
+        self._layer.load_state_dict(state_dict, False, True)
+        res = self._layer(*args)
+        return res
 
     def forward(self, tokens: torch.Tensor, indexes, cache_indexes, mask):
         _bsz, seqlen = tokens.shape
@@ -440,8 +465,15 @@ class Transformer(nn.Module):
         # indexes = torch.arange(start_pos, start_pos + seqlen)
         freqs_cis = torch.index_select(self.freqs_cis, 0, indexes)
 
-        for layer in self.layers:
-            h = layer(h, indexes, cache_indexes, freqs_cis, mask)
+        if use_jax_loop:
+            def one_loop(i, h_jax):
+                # h is jax
+                return self._call_one_layer(i, (JaxTensor(h_jax), indexes, cache_indexes, freqs_cis, mask))._elem
+            h = jax.lax.fori_loop(0, len(self.layers), one_loop, h._elem)
+            h = JaxTensor(h)
+        else:
+            for layer in self.layers:
+                h = layer(h, indexes, cache_indexes, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
         return output
