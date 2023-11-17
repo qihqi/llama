@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
+import jax.numpy as jnp
 import jax
 from llama.jax_integration import JaxTensor
 
@@ -424,10 +425,6 @@ class Transformer(nn.Module):
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
 
-        self.layers = torch.nn.ModuleList()
-        for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
-
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(
             params.dim, params.vocab_size, bias=False,
@@ -457,19 +454,19 @@ class Transformer(nn.Module):
         res = self._layer(*args)
         return res
 
-    def forward(self, tokens: torch.Tensor, indexes, cache_indexes, mask):
+    def forward(self, tokens: torch.Tensor, indexes, cache_indexes, mask, freqs_cis):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         # self.freqs_cis = self.freqs_cis.to(h.device)
         # freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         # indexes = torch.arange(start_pos, start_pos + seqlen)
-        freqs_cis = torch.index_select(self.freqs_cis, 0, indexes)
+        freqs_cis = torch.index_select(freqs_cis, 0, indexes)
 
         if use_jax_loop:
             def one_loop(i, h_jax):
                 # h is jax
-                return self._call_one_layer(i, (JaxTensor(h_jax), indexes, cache_indexes, freqs_cis, mask))._elem
-            h = jax.lax.fori_loop(0, len(self.layers), one_loop, h._elem)
+                return self._call_one_layer(i, (JaxTensor(h_jax), indexes, cache_indexes, freqs_cis, mask))._elem.astype(jnp.bfloat16)
+            h = jax.lax.fori_loop(0, self.params.n_layers, one_loop, h._elem)
             h = JaxTensor(h)
         else:
             for layer in self.layers:
