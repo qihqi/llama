@@ -11,8 +11,10 @@ from torch import nn
 import jax.numpy as jnp
 import jax
 from llama.jax_integration import JaxTensor
+from jax.experimental.pallas.ops import attention
+from jax.experimental.pallas.ops.tpu import flash_attention
 
-use_jax_loop = False
+use_jax_loop = True
 use_jax_mha = False
 
 
@@ -286,11 +288,19 @@ class Attention(nn.Module):
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        if use_jax_mha:
+            # JaxTensor -> jax.ndarry
+            jxq, jkeys, jvals = xq._elem, keys._elem, values._elem
+            causal = (mask is not None)
+            output = jax.jit(flash_attention.mha)(jxq, jkeys, jvals, segment_ids=None, causal=causal)
+            # output = jax.jit(attention.mha)(jxq, jkeys, jvals, segment_ids=None, causal=causal)
+            output = JaxTensor(output)
+        else:
+            scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if mask is not None:
+                scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
@@ -458,7 +468,9 @@ class Transformer(nn.Module):
         state_dict = {key: torch.nn.Parameter(val) if 'cache' not in key else val for key, val in state_dict.items()}
         self._layer.load_state_dict(state_dict, False, True)
         res = self._layer(*args)
-        return res
+        updated_cache_k = self._layer.attention.cache_k._elem
+        updated_cache_v = self._layer.attention.cache_v._elem
+        return res, updated_cache_k, updated_cache_v
 
     def forward(self, tokens: torch.Tensor, indexes, cache_indexes, mask, freqs_cis):
         _bsz, seqlen = tokens.shape
@@ -469,11 +481,25 @@ class Transformer(nn.Module):
         freqs_cis = torch.index_select(freqs_cis, 0, indexes)
 
         if use_jax_loop:
-            def one_loop(i, h_jax):
+            print('I am called')
+            @jax.jit
+            def one_loop(i, state):
+                h_jax, start_cache_k, start_cache_v = state
                 # h is jax
-                return self._call_one_layer(i, (JaxTensor(h_jax), indexes, cache_indexes, freqs_cis, mask))._elem.astype(jnp.bfloat16)
+                res, updated_cache_k, updated_cache_v = self._call_one_layer(
+                    i, (JaxTensor(h_jax), indexes, 
+                    cache_indexes, freqs_cis, mask))
+                res = res._elem.astype(jnp.bfloat16)
+                start_cache_k = start_cache_k.at[i].set(updated_cache_k)
+                start_cache_v = start_cache_v.at[i].set(updated_cache_k)
+                return res, start_cache_k, start_cache_v
+                
             h._elem = h._elem.astype(jnp.bfloat16)
-            h = jax.lax.fori_loop(0, self.params.n_layers, one_loop, h._elem)
+            start_cache_k = self.attention___cache_k._elem
+            start_cache_v = self.attention___cache_v._elem
+            h, new_cache_k, new_cache_v = jax.lax.fori_loop(0, self.params.n_layers, one_loop, (h._elem, start_cache_k, start_cache_v))
+            self.attention___cache_k._elem = new_cache_k
+            self.attention___cache_v._elem = new_cache_v
             h = JaxTensor(h)
         else:
             for layer in self.layers:

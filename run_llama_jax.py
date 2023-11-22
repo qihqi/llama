@@ -141,6 +141,7 @@ def wrap_weights(module):
 
 
 def run_llama2_test_jit():
+    jax.config.update('jax_default_matmul_precision', jax.lax.Precision.HIGHEST)
     param_size = 'tiny'
     context_length = 100
     infer_length = 10
@@ -162,7 +163,6 @@ def run_llama2_test_jit():
     m_torch.load_state_dict(m_jax.state_dict())  # same state dict
 
     m_jax.apply(wrap_weights)
-
 
 
     end = time.time()
@@ -276,15 +276,33 @@ def _shard_axis(name):
       #position_to_sharding[i] = (1, _NUM_OF_PARTITIONS.value)
 
 
-def run_llama_benchmark():
-    param_size = 'tiny'
-    context_length = 2048
-    infer_length = 128
-
-    model2.use_jax_loop = True 
+def run_llama_benchmark(
+    param_size = '7b',
+    context_length = 2048,
+    infer_length = 128,
+    use_jax_loop = True,
+    use_jax_mha = False,
+    print_stablehlo = False,
+):
+    model2.use_jax_loop = use_jax_loop
+    model2.use_jax_mha = use_jax_mha
     use_spmd = True
 
     print('start')
+    print("""
+    param_size = {},
+    context_length = {},
+    infer_length = {},
+    use_jax_loop = {},
+    print_stablehlo= {},
+    use_jax_mha = {},""".format(
+        param_size ,
+        context_length ,
+        infer_length ,
+        use_jax_loop ,
+        print_stablehlo,
+        use_jax_mha ,
+    ))
 
     tokenizer = Tokenizer(model_path=tokenizer_path)
     assert param_size in ('tiny', '7b', '13b', '70b'), param_size
@@ -293,7 +311,7 @@ def run_llama_benchmark():
     model_arg = get_arg(param_size, max_input_seq_length)
     model_arg.vocab_size = tokenizer.n_words
 
-    model_arg.n_layers = 10
+    # model_arg.n_layers = 10
 
     start = time.time()
     m_jax = model2.Transformer(model_arg)
@@ -332,14 +350,15 @@ def run_llama_benchmark():
     mask = jnp.full((1, 1, context_length, context_length), -jnp.inf)
     mask = jnp.triu(mask, k=1)
     args = (
-        jnp.arange(0, 2048).reshape((1, 2048)),
+        jnp.arange(0, context_length).reshape((1, context_length)),
         jnp.arange(0, context_length),
         jnp.arange(0, context_length),
         mask,
         freqs
     )
 
-    print(jitted.lower(jax_weights, jax_buffers, args).as_text())
+    if print_stablehlo:
+        print(jitted.lower(jax_weights, jax_buffers, args).as_text())
 
 
     if use_spmd:
@@ -349,7 +368,6 @@ def run_llama_benchmark():
         for name, jax_arr in zip(m_jax.param_names, jax_weights):
             axis = _shard_axis(name)
             if axis is not None:
-                print('shared', name, 'at', axis)
                 this_sharding = shardings[axis]
                 if len(jax_arr.shape) > len(this_sharding.shape):
                     this_sharding = this_sharding.reshape((1, *this_sharding.shape))
@@ -358,7 +376,6 @@ def run_llama_benchmark():
             
         for name, jax_arr in zip(m_jax.buffer_names, jax_buffers):
             if 'cache' in name:
-                print('shared', name, 'at', axis)
                 this_sharding = sharding.reshape(1, 1, num_devices, 1)
                 if len(jax_arr.shape) > len(this_sharding.shape):
                     this_sharding = this_sharding.reshape((1, *this_sharding.shape))
@@ -405,8 +422,8 @@ def run_llama_benchmark():
             results,
             cache, 
             next_token,
-            jnp.arange(1 + context_length, context_length + 2),
-            jnp.arange(2, 2 + context_length),
+            jnp.arange(context_length, context_length + 1),
+            jnp.arange(1, 1 + context_length),
         )
 
         return jax.lax.while_loop(condition, body, start).res
@@ -416,15 +433,18 @@ def run_llama_benchmark():
     key = jrandom.PRNGKey(0)
     jit_func = jax.jit(run_loop, in_shardings=None, out_shardings=None)
 
-    random_integers = jrandom.randint(key, (1, 2048,), 0, 32000)
-    # print(jit_func.lower(random_integers, sharded_caches, freqs, weights, layer_weights).as_text())
+    random_integers = jrandom.randint(key, (1, context_length,), 0, 32000)
 
 
     for i in range(3):
         print('Iteration start', i)
-        random_integers = jrandom.randint(key, (1, 2048,), 0, 32000)
+        random_integers = jrandom.randint(key, (1, context_length,), 0, 32000)
         start = time.time()
-        res = jit_func(random_integers, freqs, mask, jax_weights, jax_buffers)
+        res = jax.block_until_ready(
+            jit_func(
+                random_integers, freqs, mask, 
+                jax_weights, jax_buffers)
+        )
         end = time.time()
         print('Iteration ', i, end - start)
     print(res)
@@ -438,4 +458,5 @@ if __name__ == '__main__':
     run_llama2_test_eager()
     '''
     print('benchmark')
-    run_llama_benchmark()
+    import fire
+    fire.Fire(run_llama_benchmark)
