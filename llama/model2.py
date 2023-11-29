@@ -462,10 +462,11 @@ class Transformer(nn.Module):
             for layer_id in range(params.n_layers):
                 self.layers.append(TransformerBlock(layer_id, params))
 
-    def _call_one_layer(self, i, args):
-        state_dict = {key: JaxTensor(getattr(self, key.replace('.', '___'))._elem[i]) 
-            for key in self._keys}
-        state_dict = {key: torch.nn.Parameter(val) if 'cache' not in key else val for key, val in state_dict.items()}
+    def _call_one_layer(self, i, args, state_dict):
+        state_dict = {key: JaxTensor(state_dict[key][i])
+                      for key in self._keys}
+        state_dict = {key: torch.nn.Parameter(val) if 'cache' not in key else val 
+                      for key, val in state_dict.items()}
         self._layer.load_state_dict(state_dict, False, True)
         res = self._layer(*args)
         updated_cache_k = self._layer.attention.cache_k._elem
@@ -484,22 +485,21 @@ class Transformer(nn.Module):
             print('I am called')
             @jax.jit
             def one_loop(i, state):
-                h_jax, start_cache_k, start_cache_v = state
+                h_jax, state_dict = state
                 # h is jax
-                res, updated_cache_k, updated_cache_v = self._call_one_layer(
-                    i, (JaxTensor(h_jax), indexes, 
-                    cache_indexes, freqs_cis, mask))
+                res, cache_k, cache_v = self._call_one_layer(
+                    i, (JaxTensor(h_jax), indexes, cache_indexes, freqs_cis, mask), state_dict)
                 res = res._elem.astype(jnp.bfloat16)
-                start_cache_k = start_cache_k.at[i].set(updated_cache_k)
-                start_cache_v = start_cache_v.at[i].set(updated_cache_k)
-                return res, start_cache_k, start_cache_v
+             #   state_dict['attention.cache_k'] = state_dict['attention.cache_k'].at[i].set(cache_k)
+             #   state_dict['attention.cache_v'] = state_dict['attention.cache_v'].at[i].set(cache_v)
+                return res, state_dict 
                 
+            state_dict = {key: getattr(self, key.replace('.', '___'))._elem
+                          for key in self._keys}
             h._elem = h._elem.astype(jnp.bfloat16)
-            start_cache_k = self.attention___cache_k._elem
-            start_cache_v = self.attention___cache_v._elem
-            h, new_cache_k, new_cache_v = jax.lax.fori_loop(0, self.params.n_layers, one_loop, (h._elem, start_cache_k, start_cache_v))
-            self.attention___cache_k._elem = new_cache_k
-            self.attention___cache_v._elem = new_cache_v
+            h, state_dict = jax.lax.fori_loop(0, self.params.n_layers, one_loop, (h._elem, state_dict))
+            #self.attention___cache_k._elem = state_dict['attention.cache_k']
+            #self.attention___cache_v._elem = state_dict['attention.cache_v']
             h = JaxTensor(h)
         else:
             for layer in self.layers:

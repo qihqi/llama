@@ -31,6 +31,8 @@ def _aten_unsafe_view(x, shape):
 
 @register("aten::add")
 def _aten_add(x, y):
+    if isinstance(x, jnp.ndarray) and isinstance(y, jnp.ndarray):
+        assert x.dtype == y.dtype
     return x + y
 
 @register("aten::copy_")
@@ -55,6 +57,28 @@ def _aten_index_copy(x, dim, indexes, source):
         else:
             dims.append(slice(None, None, None))
     return x.at[dim].set(source)
+
+@register("aten::select")
+def _aten_select(x, dim, index):
+    """
+    slice_sizes = list(x.shape)
+    slice_sizes[dim] = 1
+    indexes = jnp.append(indexes, 1)
+    offset_dims = [i for i in range(len(x.shape)) if i != dim]
+    gather_dnums = jax.lax.GatherDimensionNumbers(
+        offset_dims=(dim, ),
+        collapsed_slice_dims=(dim, ),
+        start_index_map=(dim, ),
+    )
+    return jax.lax.gather(x, indexes, gather_dnums, tuple(slice_sizes))
+    """
+    dims = []
+    for i in range(len(x.shape)):
+        if i == dim:
+            dims.append(index)
+        else:
+            dims.append(slice(None, None, None))
+    return x[tuple(dims)]
 
 @register("aten::index_select")
 def _aten_index_select(x, dim, indexes):
@@ -82,9 +106,15 @@ def _aten_index_select(x, dim, indexes):
 def _aten_mean(x, dim, keepdim):
     return jnp.mean(x, dim, keepdims=keepdim)
 
+@register("aten::sub")
+def _aten_sub(x, y):
+    return x - y
+
 @register("aten::mm")
 def _aten_mm(x, y):
-    return x @ y
+  res = x @ y
+  assert res.dtype == jnp.bfloat16
+  return res
 
 @register("aten::mul")
 def _aten_mul(x, y):
@@ -132,6 +162,9 @@ def _aten_view_as_real(x):
     res = jnp.stack([real, im], -1)
     return res
 
+@register("aten::stack")
+def _aten_stack(tensors, dim=0):
+    return jnp.stack(tensors, dim)
 
 @register('aten::_softmax')
 def _aten_softmax(x, dim, halftofloat):
@@ -159,7 +192,10 @@ def _aten_div(x, y):
 
 @register('aten::bmm')
 def _aten_bmm(x, y):
-  return jnp.einsum('bnm,bmk->bnk', x, y)
+  res = x @ y
+  assert res.dtype == jnp.bfloat16
+  return res
+  # return jnp.einsum('bnm,bmk->bnk', x, y)
 
 @register('aten::embedding')
 def _aten_embedding(a, w):
@@ -271,7 +307,10 @@ class JaxTensor(torch.Tensor):
         return torch.reshape(self, new_shape)
 
     def __setitem__(self, key, val):
-        key = tuple(make_jax_array(k) if isinstance(k, torch.Tensor) else k for k in key)
+        if isinstance(key, tuple):
+            key = tuple(make_jax_array(k) if isinstance(k, torch.Tensor) else k for k in key)
+        else:
+            key = key._elem
         self._elem = self._elem.at[key].set(val._elem)
 
     __torch_function__ = torch._C._disabled_torch_function_impl
@@ -286,6 +325,8 @@ class JaxTensor(torch.Tensor):
         if func.name() == 'aten::copy_':
             args[0]._elem = res
             return args[0]
+        if res.dtype != jnp.bfloat16:
+            print(res.dtype, func.name())
         return JaxTensor(res)
 
 

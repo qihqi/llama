@@ -17,10 +17,10 @@ from typing import List, Literal, Optional, Tuple, TypedDict
 
 import torch
 import torch.nn.functional as F
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import tree_map, tree_map_only
 
 from llama.model import ModelArgs
-from llama import model2
+from llama import model2, model3
 from llama import model
 from llama.tokenizer import Tokenizer
 from jax import numpy as jnp
@@ -28,7 +28,7 @@ from llama.jax_integration import *
 
 tokenizer_path = 'tokenizer.model'
 
-jax.config.update('jax_default_matmul_precision', jax.lax.Precision.HIGHEST)
+#jax.config.update('jax_default_matmul_precision', jax.lax.Precision.HIGHEST)
 
 
 def make_cache(args):
@@ -173,6 +173,7 @@ def run_llama2_test_jit():
         (1, 1, context_length, context_length), float("-inf"),
     )
     mask = torch.triu(mask, diagonal=1)
+    mask._elem = mask._elem.astype(jnp.bfloat16)
 
     sample_input_prefill = (
         torch.randint(0, 1000, (2, context_length, )),  # len seq length
@@ -245,7 +246,8 @@ _State = collections.namedtuple(
     'State',
     [
         'res',
-        'cache',
+        'cache_k',
+        'cache_v',
         'input_tokens',
         'index',
         'cache_index',
@@ -257,7 +259,7 @@ def _shard_axis(name):
         return None
     if 'tok_embeddings' in name:
         return 0
-    if 'attention.' in name:
+    if 'attention_' in name:
       if 'wo' in name:
           return 0
         #position_to_sharding[i] = (_NUM_OF_PARTITIONS.value, 1)
@@ -284,8 +286,8 @@ def run_llama_benchmark(
     use_jax_mha = False,
     print_stablehlo = False,
 ):
-    model2.use_jax_loop = use_jax_loop
-    model2.use_jax_mha = use_jax_mha
+    model3.use_jax_loop = use_jax_loop
+    model3.use_jax_mha = use_jax_mha
     use_spmd = True
 
     print('start')
@@ -314,11 +316,16 @@ def run_llama_benchmark(
     # model_arg.n_layers = 10
 
     start = time.time()
-    m_jax = model2.Transformer(model_arg)
-    m_jax.eval()
+    m_jax_orig = model3.Transformer(model_arg)
+    m_jax_orig.eval()
 
-    freqs = jnp.array(m_jax.freqs_cis.cpu().detach().numpy())
-    m_jax, weights, buffers = make_functional_with_buffers(m_jax)
+    freqs = jnp.array(m_jax_orig.freqs_cis.cpu().detach().numpy())
+    fr = jnp.real(freqs).astype(jnp.bfloat16)
+    fi = jnp.imag(freqs).astype(jnp.bfloat16)
+    freqs = (fr, fi)
+
+
+    m_jax, weights, buffers = make_functional_with_buffers(m_jax_orig)
     m_jax.eval()
 
     def make_model_jax(model):
@@ -326,13 +333,12 @@ def run_llama_benchmark(
         def jax_callable(weights, buffers, args):
             weights = tree_map(JaxTensor, weights)
             buffers = tree_map(JaxTensor, buffers)
-            args = tree_map(JaxTensor, args)
+            args = tree_map_only(jnp.ndarray, JaxTensor, args)
             res = model(weights, buffers, *args)
-            unwrap_buffers = tuple(buf._elem for buf in buffers)
             if isinstance(res, tuple):
-                return tuple(r._elem if isinstance(r, JaxTensor) else r for r in res), unwrap_buffers
+                return tuple(r._elem if isinstance(r, JaxTensor) else r for r in res)
             else:
-                return res._elem, unwrap_buffers
+                return res._elem
         return jax_callable
 
     def make_jax_array(t):
@@ -347,14 +353,30 @@ def run_llama_benchmark(
     jax_weights = tree_map(make_jax_array, weights)
     jax_buffers = tree_map(make_jax_array, buffers)
 
-    mask = jnp.full((1, 1, context_length, context_length), -jnp.inf)
+    mask = jnp.full((1, 1, context_length, context_length), -jnp.inf, dtype=jnp.bfloat16)
     mask = jnp.triu(mask, k=1)
+    cache_k = jnp.zeros((
+        model_arg.n_layers,
+        1,
+        max_input_seq_length,
+        m_jax_orig._layer.attention.n_local_kv_heads,
+        m_jax_orig._layer.attention.head_dim
+    )).astype(jnp.bfloat16)
+    cache_v = jnp.zeros((
+        model_arg.n_layers,
+        1,
+        max_input_seq_length,
+        m_jax_orig._layer.attention.n_local_kv_heads,
+        m_jax_orig._layer.attention.head_dim
+    )).astype(jnp.bfloat16)
     args = (
         jnp.arange(0, context_length).reshape((1, context_length)),
         jnp.arange(0, context_length),
         jnp.arange(0, context_length),
         mask,
-        freqs
+        freqs,
+        cache_k,
+        cache_v,
     )
 
     if print_stablehlo:
@@ -373,30 +395,37 @@ def run_llama_benchmark(
                     this_sharding = this_sharding.reshape((1, *this_sharding.shape))
                 jax_arr = jax.device_put(jax_arr, this_sharding) 
             jax_weights_new.append(jax_arr)
-            
         for name, jax_arr in zip(m_jax.buffer_names, jax_buffers):
-            if 'cache' in name:
-                this_sharding = sharding.reshape(1, 1, num_devices, 1)
+            axis = _shard_axis(name)
+            if axis is not None:
+                this_sharding = shardings[axis]
                 if len(jax_arr.shape) > len(this_sharding.shape):
                     this_sharding = this_sharding.reshape((1, *this_sharding.shape))
-                jax_arr = jax.device_put(jax_arr, this_sharding)
+                jax_arr = jax.device_put(jax_arr, this_sharding) 
             jax_buffers_new.append(jax_arr)
 
+        cache_k = jax.device_put(cache_k, sharding.reshape(1, 1, 1, 4, 1))
+        cache_v = jax.device_put(cache_v, sharding.reshape(1, 1, 1, 4, 1))
+            
         jax_weights = jax_weights_new
         del jax_weights_new
-        jax_buffers = jax_buffers_new
+        jax_buffer = jax_buffers_new
         del jax_buffers_new
 
 
-    def run_loop(orig_inputs, freqs, mask, jax_weights, jax_buffers):
+    def run_loop(orig_inputs, freqs, mask, jax_weights, jax_buffers, cache_k, cache_v):
         prefill_input = (
             orig_inputs,
             jnp.arange(0, context_length),
             jnp.arange(0, context_length),
             mask,
-            freqs)
+            freqs,
+            cache_k, cache_v
+        )
 
-        logits, jax_buffers = jitted(jax_weights, jax_buffers, prefill_input)
+        (logits, updatek, updatev) = m_jax_func(jax_weights, jax_buffers, prefill_input)
+        cache_k = cache_k.at[:, :, jnp.arange(0, context_length)].set(updatek)
+        cache_v = cache_v.at[:, :, jnp.arange(0, context_length)].set(updatev)
         next_token = jnp.argmax(logits[0][-1]).reshape((1,))
 
         def body(state):
@@ -406,21 +435,25 @@ def run_llama_benchmark(
                 state.cache_index,
                 None,
                 freqs,
+                state.cache_k,
+                state.cache_v,
             )
-            logits, new_cache = jitted(jax_weights, state.cache, prefill_input)
+            (logits, updatek, updatev) = m_jax_func(jax_weights, jax_buffers, decode_input)
+            cache_k = state.cache_k.at[:, :, state.index].set(updatek)
+            cache_v = state.cache_v.at[:, :, state.index].set(updatev)
             next_token = jnp.argmax(logits[0][-1]).reshape((1,))
             res = state.res.at[state.index - context_length].set(next_token[0])
-            return _State(res, new_cache, next_token, state.index + 1, state.cache_index + 1)
+            return _State(res, cache_k, cache_v, next_token, state.index + 1, state.cache_index + 1)
 
         def condition(states):
             return states.index[-1] < infer_length  + context_length
 
         results = jnp.zeros((infer_length, )).astype(jnp.int64)
         results = results.at[0].set(next_token[0])
-        cache = jax_buffers
         start = _State(
             results,
-            cache, 
+            cache_k, 
+            cache_v, 
             next_token,
             jnp.arange(context_length, context_length + 1),
             jnp.arange(1, 1 + context_length),
@@ -436,6 +469,8 @@ def run_llama_benchmark(
     random_integers = jrandom.randint(key, (1, context_length,), 0, 32000)
 
 
+
+    jax.profiler.start_trace('jax_trace.pb')
     for i in range(3):
         print('Iteration start', i)
         random_integers = jrandom.randint(key, (1, context_length,), 0, 32000)
@@ -443,10 +478,11 @@ def run_llama_benchmark(
         res = jax.block_until_ready(
             jit_func(
                 random_integers, freqs, mask, 
-                jax_weights, jax_buffers)
+                jax_weights, jax_buffers, cache_k, cache_v)
         )
         end = time.time()
         print('Iteration ', i, end - start)
+    jax.profiler.stop_trace()
     print(res)
 
 

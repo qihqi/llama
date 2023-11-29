@@ -14,6 +14,9 @@ from llama.jax_integration import JaxTensor
 from jax.experimental.pallas.ops import attention
 from jax.experimental.pallas.ops.tpu import flash_attention
 
+from torch.utils._pytree import tree_map_only
+from torch._functorch.make_functional import make_functional_with_buffers
+
 use_jax_loop = True
 use_jax_mha = False
 
@@ -77,6 +80,7 @@ class RMSNorm(torch.nn.Module):
 
         """
         output = self._norm(x.float()).type_as(x)
+        output._elem = output._elem.astype(jnp.bfloat16)
         return output * self.weight
 
 
@@ -161,7 +165,43 @@ def apply_rotary_emb(
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    # TODO convert type using torch proper
+    #return xq_out.type_as(xq), xk_out.type_as(xk)
+    xq_out._elem = xq_out._elem.astype(jnp.bfloat16)
+    xk_out._elem = xk_out._elem.astype(jnp.bfloat16)
+    return xq_out, xk_out
+
+def apply_rotary_emb2(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: tuple, #torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    xq = xq.reshape(*xq.shape[:-1], -1, 2)
+    xk = xk.reshape(*xk.shape[:-1], -1, 2)
+    xq_r = xq[..., 0]
+    xq_i = xq[..., 1]
+    xk_r = xk[..., 0]
+    xk_i = xk[..., 1]
+    fr, fi = freqs_cis
+    fr = reshape_for_broadcast(fr, xq_r)
+    fi = reshape_for_broadcast(fi, xq_r)
+
+    def mul(r, i, fr, fi):
+        return (r * fr - fi * i), (r*fi + i*fr)
+
+    xq_r, xq_i = mul(xq_r, xq_i, fr, fi)
+    xk_r, xk_i = mul(xk_r, xk_i, fr, fi)
+
+    xq_out = torch.stack([xq_r, xq_i], -1).flatten(3)
+    xk_out = torch.stack([xk_r, xk_i], -1).flatten(3)
+
+    #xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    #xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    # TODO convert type using torch proper
+    #return xq_out.type_as(xq), xk_out.type_as(xk)
+    #xq_out._elem = xq_out._elem.astype(jnp.bfloat16)
+    #xk_out._elem = xk_out._elem.astype(jnp.bfloat16)
+    return xq_out, xk_out
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -233,8 +273,8 @@ class Attention(nn.Module):
         indexes, cache_indexes,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        cache_k, 
-        cache_v,
+        cache_k,  # whole cache
+        cache_v,  # whole cache
     ):
         """
         Forward pass of the attention module.
@@ -256,7 +296,7 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq, xk = apply_rotary_emb2(xq, xk, freqs_cis=freqs_cis)
 
         cache_k[:, indexes] = xk
         cache_v[:, indexes] = xv
@@ -275,7 +315,7 @@ class Attention(nn.Module):
             # JaxTensor -> jax.ndarry
             jxq, jkeys, jvals = xq._elem, keys._elem, values._elem
             causal = (mask is not None)
-            output = jax.jit(flash_attention.mha)(jxq, jkeys, jvals, segment_ids=None, causal=causal)
+            output = flash_attention.flash_attention(jxq, jkeys, jvals, segment_ids=None, causal=causal)
             # output = jax.jit(attention.mha)(jxq, jkeys, jvals, segment_ids=None, causal=causal)
             output = JaxTensor(output)
         else:
@@ -370,7 +410,8 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        indexes, cache_indexes,
+        indexes, 
+        cache_indexes,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
         cache_k, cache_v
@@ -395,6 +436,31 @@ class TransformerBlock(nn.Module):
         h = x + attn
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out, xk, xv
+
+class JittedModule:
+
+    def __init__(self, mod):
+        self.func_mod, self.weights, self.buffer = make_functional_with_buffers(mod)
+        def call_as_jax(weights, buffer, args):
+            args = tree_map_only(jnp.ndarray, JaxTensor, args)
+            weights = tree_map_only(jnp.ndarray, JaxTensor, weights)
+            buffer = tree_map_only(jnp.ndarray, JaxTensor, buffer)
+            res = self.func_mod(weights, buffer, *args)
+            if isinstance(res, tuple):
+                return tuple(r._elem if isinstance(r, JaxTensor) else r for r in res)
+            else:
+                return res._elem
+        self.func_mod_jax = jax.jit(call_as_jax)
+
+    def __call__(self, weights, buffer, *args):
+        args = tree_map_only(JaxTensor, lambda x: x._elem, args)
+        weights = tree_map_only(JaxTensor, lambda x: x._elem, weights)
+        buffer = tree_map_only(JaxTensor, lambda x: x._elem, buffer)
+        res = self.func_mod_jax(weights, buffer, args)
+        if isinstance(res, tuple):
+            return tree_map_only(jnp.ndarray, JaxTensor, res)
+        else:
+            return JaxTensor(res)
 
 
 class Transformer(nn.Module):
@@ -431,10 +497,10 @@ class Transformer(nn.Module):
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
+        self._layer = TransformerBlock(0, params)
         if use_jax_loop:
             # make one layer
             # but make the weights replicated
-            self._layer = TransformerBlock(0, params)
             self._layer.eval()
             state_dict = self._layer.state_dict()
             self._keys = list(state_dict.keys())
@@ -443,8 +509,11 @@ class Transformer(nn.Module):
                 self.register_buffer(k.replace('.', '___'), weights)
         else:
             self.layers = torch.nn.ModuleList()
+            self._layers2 = []
             for layer_id in range(params.n_layers):
-                self.layers.append(TransformerBlock(layer_id, params))
+                m = TransformerBlock(layer_id, params)
+                self.layers.append(m)
+                self._layers2.append(JittedModule(m))
 
     def _call_one_layer(self, i, args, state_dict, new_cache_k, new_cache_v):
         state_dict = {key: JaxTensor(state_dict[key][i])
@@ -460,46 +529,60 @@ class Transformer(nn.Module):
         new_cache_v.at[i].set(xv._elem)
         return res, new_cache_k, new_cache_v
 
+    def _call_one_layer2(self, inputs, weights):
+        cache_k, cache_v = weights[-2:]
+        cache_k = JaxTensor(cache_k)
+        cache_v = JaxTensor(cache_v)
+        state_dict = {key: JaxTensor(w) for key, w in zip(self._keys, weights[:-2])}
+        state_dict = {key: torch.nn.Parameter(val) if 'cache' not in key else val 
+                      for key, val in state_dict.items()}
+        self._layer.load_state_dict(state_dict, False, True)
+        h, indexes, cache_indexes, freqs_cis, mask = tree_map_only(jnp.ndarray,
+            lambda x: JaxTensor(x), inputs)
+        res, xk, xv = self._layer(
+            h, indexes, cache_indexes, freqs_cis, mask, cache_k, cache_v)
+        return tree_map_only(JaxTensor, 
+            lambda x: x._elem,
+            (res, indexes, cache_indexes, freqs_cis, mask)), (xk._elem, xv._elem)
+
     def forward(self, tokens: torch.Tensor, indexes, cache_indexes, mask, freqs_cis, cache_k, cache_v):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         # self.freqs_cis = self.freqs_cis.to(h.device)
         # freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         # indexes = torch.arange(start_pos, start_pos + seqlen)
-        freqs_cis = torch.index_select(freqs_cis, 0, indexes)
+        fr, fi = freqs_cis
+        fr = torch.index_select(fr, 0, indexes)
+        fi = torch.index_select(fi, 0, indexes)
+        freqs_cis = (fr, fi)
 
         if use_jax_loop:
             print('I am called')
-            def one_loop(i, state):
-                h_jax, state_dict, new_cache_k, new_cache_v = state
-                # h is jax
-                res, new_cache_k, new_cache_v = self._call_one_layer(
-                    i, (JaxTensor(h_jax), indexes, cache_indexes, freqs_cis, mask, cache_k, cache_v), 
-                        state_dict, new_cache_k, new_cache_v)
-                res = res._elem.astype(jnp.bfloat16)
-             #   state_dict['attention.cache_k'] = state_dict['attention.cache_k'].at[i].set(cache_k)
-             #   state_dict['attention.cache_v'] = state_dict['attention.cache_v'].at[i].set(cache_v)
-                return res, state_dict, new_cache_k, new_cache_v
-            state_dict = {key: getattr(self, key.replace('.', '___'))._elem
-                          for key in self._keys}
+
+            state_dict = [
+                getattr(self, key.replace('.', '___'))._elem
+                for key in self._keys
+            ]
+            state_dict.append(cache_k._elem)
+            state_dict.append(cache_v._elem)
             h._elem = h._elem.astype(jnp.bfloat16)
-            local_heads = self._layer.attention.n_local_kv_heads
-            headdim = self._layer.attention.head_dim
-            new_cache_k = jnp.zeros((self.params.n_layers, _bsz, seqlen, local_heads, headdim))
-            new_cache_v = jnp.zeros((self.params.n_layers, _bsz, seqlen, local_heads, headdim))
-            start_state = (
-                h._elem,
-                state_dict,
-                new_cache_k,
-                new_cache_v
-            )
-            h, state_dict, new_cache_k, new_cache_v = jax.lax.fori_loop(0, self.params.n_layers, one_loop, start_state)
-            #self.attention___cache_k._elem = state_dict['attention.cache_k']
-            #self.attention___cache_v._elem = state_dict['attention.cache_v']
+            
+            carry = tree_map_only(torch.Tensor, 
+                lambda x: x._elem,
+                (h, indexes, cache_indexes, freqs_cis, mask))
+            carry, stacked_caches = jax.lax.scan(self._call_one_layer2, carry, state_dict)
+            h = carry[0]
             h = JaxTensor(h)
         else:
-            for layer in self.layers:
-                h = layer(h, indexes, cache_indexes, freqs_cis, mask)
+            for layer, layer_jit in zip(self.layers, self._layers2):
+                state_dict = layer.state_dict()
+                states = [state_dict[name] for name in layer_jit.func_mod.param_names]
+                buffers = [state_dict[name] for name in layer_jit.func_mod.buffer_names]
+                h, xk, xv = layer_jit(
+                    states, buffers, h, indexes, cache_indexes, 
+                    freqs_cis, mask, cache_k, cache_v)
+            stacked_caches = [cache_k, cache_v]
+
         h = self.norm(h)
         output = self.output(h).float()
-        return output, new_cache_k, new_cache_v
+        return output, stacked_caches[0], stacked_caches[1]
