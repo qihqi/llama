@@ -281,7 +281,7 @@ class Transformer(nn.Module):
         
         new_caches = []
         for layer, (cache_k, cache_v) in zip(self.layers, caches):
-            h, new_k, new_v  = layer(h, freqs_cis, mask, input_indexes, cache_indexes, cache_v, cache_k)
+            h, new_k, new_v  = layer(h, freqs_cis, mask, input_indexes, cache_indexes, cache_k, cache_v)
             new_caches.append((new_k, new_v))
         h = self.norm(h)
         output = self.output(h).float()
