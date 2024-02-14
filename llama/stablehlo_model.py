@@ -84,13 +84,13 @@ def make_cache(args, batch_size):
                 n_local_kv_heads,
                 head_dim,
             )
-        res.append((torch.zeros(size), torch.zeros(size)))
+        res.append((torch.zeros(size, dtype=torch.bfloat16 if args.bf16_enable else torch.float), torch.zeros(size, dtype=torch.bfloat16  if args.bf16_enable else torch.float)))
     return res
 
 
 def get_arg(param_size, seqlen):
     if param_size == 'tiny':
-        data = {"dim": 128, "multiple_of": 32, "n_heads": 2, "n_layers": 3, "norm_eps": 1e-05, "vocab_size": -1}
+        data = {"dim": 128, "multiple_of": 32, "n_heads": 2, "n_layers": 3, "norm_eps": 1e-05, "vocab_size": -1} 
     elif param_size == '7b':
         data = {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-05, "vocab_size": -1}
     elif param_size == '13b':
@@ -274,3 +274,4 @@ def load_stablehlo_model(checkpoint_dir, model_dir):
             checkpoint = make_random_checkpoint(shlo._bundle)
     caches = make_cache(model_arg, metadata['batch_size'])
     return Llama2StableHLO(checkpoint, shlo), caches
+

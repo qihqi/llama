@@ -108,6 +108,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        prefill: bool,
         input_indexes: torch.Tensor,
         cache_indexes: torch.Tensor,
         cache_k, cache_v
@@ -121,27 +122,33 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        input_indexes = input_indexes.to(torch.int64)
+
         cache_k = cache_k.index_copy(1, input_indexes, xk)
         cache_v = cache_v.index_copy(1, input_indexes, xv)
 
-        keys = cache_k.index_select(1, cache_indexes)
-        values = cache_v.index_select(1, cache_indexes)
-
+        #keys = cache_k.index_select(1, cache_indexes)
+        #values = cache_v.index_select(1, cache_indexes)
+        keys = cache_k
+        values = cache_v
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         values = repeat_kv(values, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-
-        xq = xq.transpose(-3, -2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(-3, -2)
-        values = values.transpose(-3, -2)
-        scores = torch.matmul(xq, keys.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        
+        #xq = xq.transpose(-3, -2)  # (bs, n_local_heads, seqlen, head_dim)
+        #keys = keys.transpose(-3,-2)
+        #values = values.transpose(-3,-2)
+        xq_new = torch.clone(xq) 
+        scores = torch.matmul(xq_new, keys.transpose(-3,-2).transpose(-2, -1)) / math.sqrt(self.head_dim)
+        #scores = torch.einsum('ijkl,imkl->ikjm', xq_new, keys) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, max_seqlen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq_new)
+        output = torch.matmul(scores, values.transpose(-3,-2))  # (bs, n_local_heads, seqlen, head_dim)
+        #output = torch.einsum('ikjm,imkl->ikjl', scores, values)
         output = output.transpose(-3, -2).contiguous().view(bsz, seqlen, -1)
+        
         return self.wo(output), cache_k, cache_v
-
 
 class FeedForward(nn.Module):
     def __init__(
@@ -209,15 +216,16 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        prefill: bool,
         input_indexes: torch.Tensor,
         cache_indexes, cache_k, cache_v,
     ):
-        attn, cache_k, cache_v = self.attention.forward(
-            self.attention_norm(x), freqs_cis, mask, input_indexes, cache_indexes, cache_k, cache_v
+        attn, xk, xv = self.attention.forward(
+            self.attention_norm(x), freqs_cis, mask, prefill, input_indexes, cache_indexes, cache_k, cache_v
         )
         h = x + attn
         out = h + self.feed_forward.forward(self.ffn_norm(h))
-        return out, cache_k, cache_v
+        return out, xk, xv
 
 
 class Transformer(nn.Module):
@@ -257,10 +265,9 @@ class Transformer(nn.Module):
         )
         # self.register_buffer("freqs_cis", freqs_cis)
         self.freqs_cis = freqs_cis
-
         mask = torch.full(
             (1, 1, self.params.max_seq_len, self.params.max_seq_len),
-            float("-inf")).to(torch.float)
+            float("-inf")).to(torch.bfloat16 if self.params.bf16_enable else torch.float)
         mask = torch.triu(mask, diagonal=1)
         self.mask = mask
         # self.register_buffer("mask", mask)
@@ -270,19 +277,19 @@ class Transformer(nn.Module):
                 caches: List[Tuple[torch.tensor, ...]], prefill):
         seqlen = tokens.shape[-1]
         h = self.tok_embeddings(tokens)
-        # import pdb; pdb.set_trace()
         freqs_cis = self.freqs_cis.index_select(0, input_indexes)
         mask = None
         if prefill:
             mask = torch.full(
                 (1, 1, seqlen, seqlen),
-                float("-inf")).to(torch.float)
+                float("-inf")).to(torch.bfloat16 if self.params.bf16_enable else torch.float)
             mask = torch.triu(mask, diagonal=1)
         
         new_caches = []
         for layer, (cache_k, cache_v) in zip(self.layers, caches):
-            h, new_k, new_v  = layer(h, freqs_cis, mask, input_indexes, cache_indexes, cache_v, cache_k)
+            h, new_k, new_v  = layer(h, freqs_cis, mask, prefill, input_indexes, cache_indexes, cache_k, cache_v)
             new_caches.append((new_k, new_v))
         h = self.norm(h)
         output = self.output(h).float()
         return output, new_caches
+

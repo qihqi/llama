@@ -22,7 +22,6 @@ ckpt_dir = 'llama-2-7b-chat'
 tokenizer_path = 'tokenizer.model'
 
 
-
 def verify_cache(caches, model1):
     for i, layer in enumerate(model1.layers):
         k1, v1 = caches[i]
@@ -58,8 +57,9 @@ def make_exported_to_use_orig_names(nn_module, exported):
     for param in exported.graph_signature.input_specs:
         if param.kind.name in ('PARAMETER', 'BUFFER'):
             param.target = old_name_to_new_name[param.target]
-        
 
+
+@torch.no_grad()
 def export_llama2_to_stablehlo(
     path_prefix: str,
     checkpoint_dir: Optional[str] = None,
@@ -68,7 +68,9 @@ def export_llama2_to_stablehlo(
     context_length: int = 2048,
     infer_length: int = 256,
     write_meta: bool = True,
+    bf16_enable: bool = False,
 ):
+    
     print('start')
     tokenizer = Tokenizer(model_path=tokenizer_path)
     assert param_size in ('tiny', '7b', '13b', '70b'), param_size
@@ -76,6 +78,7 @@ def export_llama2_to_stablehlo(
 
     model_arg = get_arg(param_size, max_input_seq_length)
     model_arg.vocab_size = tokenizer.n_words
+    model_arg.bf16_enable = bf16_enable
 
     start = time.time()
     if batch_size is None:
@@ -83,10 +86,13 @@ def export_llama2_to_stablehlo(
     else:
         m = model_exportable.Transformer(model_arg)
 
+    if bf16_enable:
+      m = m.to(torch.bfloat16)
+
     end = time.time()
     print('Model init took', end - start, 'seconds')
-    caches = make_cache(model_arg, batch_size)
-
+    prefill_caches = make_cache(model_arg, 1)
+    decode_caches = make_cache(model_arg, batch_size)
     if checkpoint_dir:
         checkpoints = sorted(Path(checkpoint_dir).glob("*.pth"))
         assert len(checkpoints) == 1, 'currently only support one file'
@@ -96,42 +102,49 @@ def export_llama2_to_stablehlo(
         m.load_state_dict(checkpoint, strict=False)
 
     if batch_size is not None:
-        input_shape_prefill = (batch_size, context_length)
+        #input_shape_prefill = (batch_size, context_length)
+        input_shape_prefill = (1, context_length)
         input_shape_decode = (batch_size, 1)
     else:
         input_shape_prefill = (context_length, )
         input_shape_decode = (1,)
 
+
     sample_input_prefill = (
-        torch.randint(0, 1000, input_shape_prefill),  # len seq length
-        torch.arange(0, context_length), # input indexes
-        torch.arange(0, context_length), # context indexes
-        caches, # caches
+        torch.randint(0, 1000, input_shape_prefill,dtype=torch.int32),  # len seq length
+        torch.arange(0, context_length, dtype=torch.int32), # input indexes
+        torch.arange(0, context_length, dtype=torch.int32), # context indexes
+        prefill_caches,
         True, # prefil
     )
     #m(*sample_input_prefill)
-
+    
     sample_input_decode = (
-        torch.randint(0, 1000, input_shape_decode),  # len = 1
-        torch.arange(context_length, context_length + 1), # input indexes
-        torch.arange(1, context_length + 1), # context indexes
-        caches,
+        torch.randint(0, 1000, input_shape_decode, dtype=torch.int32),  # len = 1
+        torch.tensor([0], dtype=torch.int32),
+        torch.roll(torch.arange(context_length, dtype=torch.int32),1,0),
+        decode_caches,
         False # prefill
     )
+    #m(*sample_input_decode)
 
+    print('exporting to stablehlo use original name')
     exported_prefill = torch.export.export(m, sample_input_prefill)
     make_exported_to_use_orig_names(m, exported_prefill)
     exported_decode = torch.export.export(m, sample_input_decode)
     make_exported_to_use_orig_names(m, exported_decode)
 
-    shlo_prefill = stablehlo.exported_program_to_stablehlo(exported_prefill)
-    shlo_decode = stablehlo.exported_program_to_stablehlo(exported_decode)
+    print('exporting to stablehlo')
+    shlo_prefill = stablehlo.exported_program_to_stablehlo(exported_prefill, stablehlo.StableHLOExportOptions(save_weights=False))
+    shlo_decode = stablehlo.exported_program_to_stablehlo(exported_decode, stablehlo.StableHLOExportOptions(save_weights=False))
 
+    print('merge bundle')
     merged = merge_bundle(prefill=shlo_prefill._bundle, decode=shlo_decode._bundle)
     stablehlo._save_program_bundle(merged, path_prefix)
 
+    print('write meta')
     if write_meta:
-        with open(os.path.join(path_prefix, 'METADATA.json'), 'w') as f:
+        with open(os.path.join(path_prefix, 'META.json'), 'w') as f:
             json.dump({
                 'context_length': context_length, 
                 'infer_length': infer_length, 

@@ -25,6 +25,7 @@ class ModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 2048
 
+    bf16_enable: bool = False
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -437,7 +438,7 @@ class Transformer(nn.Module):
 
         mask = torch.full(
             (1, 1, self.params.max_seq_len, self.params.max_seq_len),
-            float("-inf")).to(torch.float)
+            float("-inf")).to(torch.bfloat16 if self.params.bf16_enable else torch.float)
         mask = torch.triu(mask, diagonal=1)
         self.mask = mask
         #self.register_buffer("mask", mask)
