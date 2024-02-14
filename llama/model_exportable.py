@@ -139,13 +139,13 @@ class Attention(nn.Module):
         #keys = keys.transpose(-3,-2)
         #values = values.transpose(-3,-2)
         xq_new = torch.clone(xq) 
-        scores = torch.matmul(xq_new, keys.transpose(-3,-2).transpose(-2, -1)) / math.sqrt(self.head_dim)
-        #scores = torch.einsum('ijkl,imkl->ikjm', xq_new, keys) / math.sqrt(self.head_dim)
+        #scores = torch.matmul(xq_new, keys.transpose(-3,-2).transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = torch.einsum('ijkl,imkl->ikjm', xq_new, keys) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, max_seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq_new)
-        output = torch.matmul(scores, values.transpose(-3,-2))  # (bs, n_local_heads, seqlen, head_dim)
-        #output = torch.einsum('ikjm,imkl->ikjl', scores, values)
+        #output = torch.matmul(scores, values.transpose(-3,-2))  # (bs, n_local_heads, seqlen, head_dim)
+        output = torch.einsum('ikjm,imkl->ikjl', scores, values)
         output = output.transpose(-3, -2).contiguous().view(bsz, seqlen, -1)
         
         return self.wo(output), cache_k, cache_v
